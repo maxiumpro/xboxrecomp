@@ -271,6 +271,9 @@ const volatile uint8_t *xbox_PhysImageNameMap(void);
  * before the layout is up. The APU's DSP device runs its GP and EP on their
  * pages of it (+0x30000, +0x50000), which the title writes untrapped. */
 void *xbox_McpxHost(void);
+/* Whether physical byte `pa` lies in a live heap block the title named:
+ * the page map refined to the block (see xbox_PhysRamNamedAt). */
+int xbox_PhysRamNamedAt(uint32_t pa);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
