@@ -91,12 +91,15 @@
 #include "d3d8_msl.h"
 #include "nv2a_basic_msl.h"
 #include "metal_compile.h"
+#include "shader_cache.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "nv2a_dbg_draw.h"
 #endif
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
 ptrdiff_t xbox_GetMemoryOffset(void);
+/* kernel_path.c: <HDD root>/ShaderCache, which the preload list sits under. */
+int xbox_path_shader_cache(char *out, size_t n);
 
 #if __has_feature(objc_arc)
 #error "nv2a_pb_metal.m is manual retain/release: build it without -fobjc-arc"
@@ -328,6 +331,13 @@ static int sh_trace(void)
     return s_sh_trace;
 }
 
+/* The preload list ("The preload list" below): init starts the preload;
+ * compile_fn and pipeline() record what they build. */
+static void preload_start(void);
+static void pl_note_library(id<MTLFunction> fn, const char *what, const char *name,
+                            const char *src);
+static void pl_note_pso(id<MTLFunction> vs, id<MTLFunction> fs, const uint32_t key[6]);
+
 /* Each render encoder made, so a binding remembered against one is never
  * taken for another's (an address can come back after a release). */
 static uint64_t s_enc_serial;
@@ -514,6 +524,7 @@ static int init(void)
                 wb_always() ? "every flip" : "on demand");
     }
     s_failed = 0;
+    preload_start();
     return 1;
 }
 
@@ -1108,11 +1119,46 @@ typedef struct {
 static struct { PsoKey k; id<MTLRenderPipelineState> pso; } s_pso[PSO_MAX];
 static int s_pso_n, s_pso_last;
 
+/* The pipeline state for vs, fs and a pipeline() key (+1, nil on failure).
+ * pipeline() and the preload both build here, so what the preload warms is
+ * what the game asks for. Any thread: it touches only its arguments. */
+static id<MTLRenderPipelineState> pso_build(id<MTLDevice> dev, id<MTLFunction> vs,
+                                            id<MTLFunction> fs, const uint32_t key[6],
+                                            NSError **err)
+{
+    MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+    MTLRenderPipelineColorAttachmentDescriptor *ca;
+    id<MTLRenderPipelineState> pso;
+
+    pd.vertexFunction = vs;
+    pd.fragmentFunction = fs;
+    ca = pd.colorAttachments[0];
+    ca.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    ca.blendingEnabled = key[0] ? YES : NO;
+    if (key[0]) {
+        ca.sourceRGBBlendFactor = blend_factor(key[1], 0);
+        ca.destinationRGBBlendFactor = blend_factor(key[2], 0);
+        ca.sourceAlphaBlendFactor = blend_factor(key[1], 1);
+        ca.destinationAlphaBlendFactor = blend_factor(key[2], 1);
+        ca.rgbBlendOperation = (MTLBlendOperation)key[4];
+        ca.alphaBlendOperation = (MTLBlendOperation)key[4];
+    }
+    ca.writeMask = ((key[3] & 0x00FF0000u) ? 0 : MTLColorWriteMaskRed)
+                 | ((key[3] & 0x0000FF00u) ? 0 : MTLColorWriteMaskGreen)
+                 | ((key[3] & 0x000000FFu) ? 0 : MTLColorWriteMaskBlue)
+                 | ((key[3] & 0xFF000000u) ? 0 : MTLColorWriteMaskAlpha);
+    if (key[5]) {
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    }
+    pso = [dev newRenderPipelineStateWithDescriptor:pd error:err];
+    [pd release];
+    return pso;
+}
+
 static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> fs)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
-    MTLRenderPipelineDescriptor *pd;
-    MTLRenderPipelineColorAttachmentDescriptor *ca;
     id<MTLRenderPipelineState> pso;
     NSError *err = nil;
     PsoKey pk;
@@ -1136,31 +1182,9 @@ static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> f
             return s_pso[i].pso;
         }
 
-    pd = [[MTLRenderPipelineDescriptor alloc] init];
-    pd.vertexFunction = vs;
-    pd.fragmentFunction = fs;
-    ca = pd.colorAttachments[0];
-    ca.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    ca.blendingEnabled = key[0] ? YES : NO;
-    if (key[0]) {
-        ca.sourceRGBBlendFactor = blend_factor(key[1], 0);
-        ca.destinationRGBBlendFactor = blend_factor(key[2], 0);
-        ca.sourceAlphaBlendFactor = blend_factor(key[1], 1);
-        ca.destinationAlphaBlendFactor = blend_factor(key[2], 1);
-        ca.rgbBlendOperation = (MTLBlendOperation)key[4];
-        ca.alphaBlendOperation = (MTLBlendOperation)key[4];
-    }
-    ca.writeMask = ((key[3] & 0x00FF0000u) ? 0 : MTLColorWriteMaskRed)
-                 | ((key[3] & 0x0000FF00u) ? 0 : MTLColorWriteMaskGreen)
-                 | ((key[3] & 0x000000FFu) ? 0 : MTLColorWriteMaskBlue)
-                 | ((key[3] & 0xFF000000u) ? 0 : MTLColorWriteMaskAlpha);
-    if (key[5]) {
-        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-        pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-    }
     {
         uint64_t t0 = prof_now(), ns;
-        pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        pso = pso_build(s_dev, vs, fs, key, &err);
         ns = prof_now() - t0;
         s_sh_flip.pso_ns += ns;
         s_sh_flip.pso++;
@@ -1168,7 +1192,6 @@ static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> f
             fprintf(stderr, LOGP "shader: pipeline %.2f ms (blend %u, depth %u), flip %llu\n",
                     ns / 1e6, key[0], key[5], (unsigned long long)s_presents);
     }
-    [pd release];
     if (!pso) {
         static int said;
         if (!said++)
@@ -1176,6 +1199,7 @@ static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> f
                     err ? [[err localizedDescription] UTF8String] : "?");
         return nil;
     }
+    pl_note_pso(vs, fs, key);
     if (s_pso_n < PSO_MAX) {
         i = s_pso_n++;
     } else {
@@ -1938,21 +1962,50 @@ static id<MTLSamplerState> sampler(const Stage *t, int bump_source, uint32_t sca
 
 static uint64_t s_compile_errors, s_vs_compiled, s_fs_compiled;
 
+/* metal_shader_nonce and metal_shader_dump, read once on the ack thread
+ * (compile_fn, and preload_start before the preload is queued, so the
+ * preload's thread only reads them). */
+static const char *s_sh_nonce, *s_sh_dump;
+
+static void sh_env(void)
+{
+    static int read;
+    if (!read) {
+        read = 1;
+        s_sh_nonce = recomp_env(RENV_METAL_SHADER_NONCE);
+        s_sh_dump = recomp_env(RENV_METAL_SHADER_DUMP);
+    }
+}
+
+/* A new entry name is new AIR: both the source and the function caches
+ * of macOS miss, as on a player's first launch. compile_fn and the preload
+ * both rename here, so under a nonce the preload builds what the game will.
+ * Returns the text to compile (autoreleased) and sets *name. */
+static NSString *sh_nonce_rename(NSString *text, NSString **name)
+{
+    if (s_sh_nonce && *s_sh_nonce) {
+        NSString *nn = [NSString stringWithFormat:@"%@_%s_%d", *name, s_sh_nonce,
+                                                  (int)getpid()];
+        text = [text stringByReplacingOccurrencesOfString:
+                     [NSString stringWithFormat:@" %@(", *name]
+                 withString:[NSString stringWithFormat:@" %@(", nn]];
+        *name = nn;
+    }
+    return text;
+}
+
 static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *what)
 {
-    static int nonce_read;
-    static const char *nonce, *dump;
+    const char *dump;
     NSError *err = nil;
     NSString *text = [NSString stringWithUTF8String:src];
+    NSString *orig = name;
     id<MTLLibrary> lib;
     id<MTLFunction> fn;
     uint64_t t0, ns;
 
-    if (!nonce_read) {
-        nonce_read = 1;
-        nonce = recomp_env(RENV_METAL_SHADER_NONCE);
-        dump = recomp_env(RENV_METAL_SHADER_DUMP);
-    }
+    sh_env();
+    dump = s_sh_dump;
     if (dump) {
         static int dump_said;
         char path[1024];
@@ -1973,15 +2026,7 @@ static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *w
                     ? path : dump);
         }
     }
-    /* A new entry name is new AIR: both the source and the function caches
-     * of macOS miss, as on a player's first launch. */
-    if (nonce && *nonce) {
-        NSString *nn = [NSString stringWithFormat:@"%@_%s_%d", name, nonce, (int)getpid()];
-        text = [text stringByReplacingOccurrencesOfString:
-                     [NSString stringWithFormat:@" %@(", name]
-                 withString:[NSString stringWithFormat:@" %@(", nn]];
-        name = nn;
-    }
+    text = sh_nonce_rename(text, &name);
     t0 = prof_now();
     lib = metal_compile_library(s_dev, text, what, &err);
     ns = prof_now() - t0;
@@ -2002,6 +2047,8 @@ static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *w
     if (!fn) {
         s_compile_errors++;
         fprintf(stderr, LOGP "%s: no function %s\n", what, [name UTF8String]);
+    } else {
+        pl_note_library(fn, what, [orig UTF8String], src);   /* as generated */
     }
     return fn;
 }
@@ -2211,6 +2258,468 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     memo.valid = 1;
     memo.fn = e->bad ? fs_basic() : e->fn;   /* as D3D11: the basic PS */
     return memo.fn;
+}
+
+/* ---- the preload list --------------------------------------------------------
+ *
+ * macOS caches compiled shaders and pipeline states itself, but only once a
+ * run has built them: each effect's first sight still compiles on the ack
+ * thread (RECOMP_TRACE=metal_shaders, the [metal] build lines). This keeps
+ * a list of what runs built, <hdd dir>/ShaderCache/metal/preload.bin
+ * (RECOMP_METAL_PRELOAD: off, or another file), and at the next start
+ * builds it all again on a background queue, so macOS's caches are warm
+ * when the game asks. What the preload builds is thrown away: the game's
+ * own build still runs, and hits.
+ *
+ * The file: PL_MAGIC and a version word, then records, each a payload
+ * length and the payload's FNV-1a 32 ahead of the payload, appended and
+ * flushed one at a time. A load stops at the first record that does not
+ * check (a run cut short mid-write) and cuts the file there, so later
+ * appends stay readable; a wrong magic or version starts the file over.
+ *   L  a compile_fn library: what, the entry name and the MSL source as
+ *      generated (before metal_shader_nonce's rename)
+ *   P  a pipeline() state: its two functions by identity and its key[6]
+ * A function's identity is the FNV-1a 64 of its entry name and source (two
+ * entries of one source are two functions). The base library's vs_pass and
+ * fs_basic have one too, so their pipelines are listed; the preload uses
+ * the functions init built for them.
+ *
+ * Threads: the record set, the function map and the FILE are the ack
+ * thread's. The preload gets its own copy of the records init read, and
+ * the device (thread-safe); nothing waits on it. */
+
+#define PL_MAGIC       "XRMTLPL\x1a"
+#define PL_VERSION     1u
+#define PL_HEAD        12u               /* magic, version */
+#define PL_MAX_RECORDS 4096u
+#define PL_MAX_PAYLOAD (1u << 20)
+#define PL_L_HEAD      20u               /* 'L', pad, u16 what, u16 name, u32 src, u64 ident */
+#define PL_P_SIZE      44u               /* 'P', pad, u64 vs, u64 fs, u32 key[6] */
+#define PL_SET_SLOTS   8192u             /* > 2 x PL_MAX_RECORDS */
+#define PL_FN_SLOTS    4096u             /* > VS_MAX + FS_MAX + the rest */
+#define FNV64_INIT     0xcbf29ce484222325ull
+
+static int      s_pl_on;                 /* recording: the list is open */
+static FILE    *s_pl_file;
+static char     s_pl_path[1100];
+static unsigned s_pl_n;                  /* records in the file */
+static uint64_t s_pl_set[PL_SET_SLOTS];  /* their identities, 0 = empty slot */
+static struct { const void *fn; uint64_t ident; } s_pl_fn[PL_FN_SLOTS];
+
+static uint64_t fnv64(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    while (n--) {
+        h ^= *b++;
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static uint64_t pl_fn_identity(const char *name, const char *src, size_t src_len)
+{
+    uint64_t h = fnv64(FNV64_INIT, name, strlen(name) + 1);
+    h = fnv64(h, src, src_len);
+    return h ? h : 1;
+}
+
+/* 1 when ident was not in the set (it is now). */
+static int pl_set_add(uint64_t ident)
+{
+    unsigned i = (unsigned)(ident ^ ident >> 32) & (PL_SET_SLOTS - 1);
+    while (s_pl_set[i]) {
+        if (s_pl_set[i] == ident)
+            return 0;
+        i = (i + 1) & (PL_SET_SLOTS - 1);
+    }
+    s_pl_set[i] = ident;
+    return 1;
+}
+
+static unsigned pl_fn_slot(const void *fn)
+{
+    uintptr_t p = (uintptr_t)fn;
+    return (unsigned)(((p >> 4) ^ (p >> 20)) * 0x9E3779B1u) & (PL_FN_SLOTS - 1);
+}
+
+/* The backend keeps every function it builds for the life of the process,
+ * so a pointer names one function. */
+static void pl_fn_note(id<MTLFunction> fn, uint64_t ident)
+{
+    unsigned i = pl_fn_slot(fn), k;
+    for (k = 0; k < PL_FN_SLOTS; k++, i = (i + 1) & (PL_FN_SLOTS - 1))
+        if (!s_pl_fn[i].fn || s_pl_fn[i].fn == fn) {
+            s_pl_fn[i].fn = fn;
+            s_pl_fn[i].ident = ident;
+            return;
+        }
+}
+
+static uint64_t pl_fn_id(id<MTLFunction> fn)
+{
+    unsigned i = pl_fn_slot(fn), k;
+    for (k = 0; k < PL_FN_SLOTS && s_pl_fn[i].fn; k++, i = (i + 1) & (PL_FN_SLOTS - 1))
+        if (s_pl_fn[i].fn == fn)
+            return s_pl_fn[i].ident;
+    return 0;
+}
+
+static void pl_append(const uint8_t *payload, uint32_t len)
+{
+    uint8_t hd[8];
+    uint32_t ck = fnv(payload, len);
+    memcpy(hd, &len, 4);
+    memcpy(hd + 4, &ck, 4);
+    if (fwrite(hd, 1, 8, s_pl_file) != 8 || fwrite(payload, 1, len, s_pl_file) != len
+     || fflush(s_pl_file) != 0) {
+        fprintf(stderr, LOGP "preload: cannot write %s; the list stops here\n", s_pl_path);
+        fclose(s_pl_file);
+        s_pl_file = NULL;
+        s_pl_on = 0;
+        return;
+    }
+    s_pl_n++;
+}
+
+static void pl_note_library(id<MTLFunction> fn, const char *what, const char *name,
+                            const char *src)
+{
+    size_t wl, nl, sl;
+    uint32_t len;
+    uint16_t w16, n16;
+    uint32_t s32;
+    uint64_t ident;
+    uint8_t *p;
+
+    if (!s_pl_on || !name || !src)
+        return;
+    sl = strlen(src);
+    ident = pl_fn_identity(name, src, sl);
+    pl_fn_note(fn, ident);
+    if (s_pl_n >= PL_MAX_RECORDS || !pl_set_add(ident))   /* the set stays half empty */
+        return;
+    wl = strlen(what);
+    if (wl > 255)
+        wl = 255;
+    nl = strlen(name);
+    if (nl > 255 || sl + wl + nl + PL_L_HEAD > PL_MAX_PAYLOAD)
+        return;
+    len = (uint32_t)(PL_L_HEAD + wl + nl + sl);
+    if (!(p = (uint8_t *)calloc(1, len)))
+        return;
+    w16 = (uint16_t)wl;
+    n16 = (uint16_t)nl;
+    s32 = (uint32_t)sl;
+    p[0] = 'L';
+    memcpy(p + 4, &w16, 2);
+    memcpy(p + 6, &n16, 2);
+    memcpy(p + 8, &s32, 4);
+    memcpy(p + 12, &ident, 8);
+    memcpy(p + PL_L_HEAD, what, wl);
+    memcpy(p + PL_L_HEAD + wl, name, nl);
+    memcpy(p + PL_L_HEAD + wl + nl, src, sl);
+    pl_append(p, len);
+    free(p);
+}
+
+static void pl_note_pso(id<MTLFunction> vs, id<MTLFunction> fs, const uint32_t key[6])
+{
+    uint8_t p[PL_P_SIZE];
+    uint64_t vid, fid, ident;
+
+    if (!s_pl_on)
+        return;
+    /* A function no compile_fn built (and not vs_pass or fs_basic): not
+     * listed, nor its pipelines. */
+    if (!(vid = pl_fn_id(vs)) || !(fid = pl_fn_id(fs)))
+        return;
+    memset(p, 0, sizeof p);
+    p[0] = 'P';
+    memcpy(p + 4, &vid, 8);
+    memcpy(p + 12, &fid, 8);
+    memcpy(p + 20, key, 24);
+    ident = fnv64(FNV64_INIT, p, sizeof p);
+    if (!ident)
+        ident = 1;
+    if (s_pl_n >= PL_MAX_RECORDS || !pl_set_add(ident))   /* the set stays half empty */
+        return;
+    pl_append(p, PL_P_SIZE);
+}
+
+/* A record the parser can take: its type and its lengths add up. */
+static int pl_record_ok(const uint8_t *p, uint32_t len)
+{
+    uint16_t wl, nl;
+    uint32_t sl;
+    if (p[0] == 'P')
+        return len == PL_P_SIZE;
+    if (p[0] != 'L' || len < PL_L_HEAD)
+        return 0;
+    memcpy(&wl, p + 4, 2);
+    memcpy(&nl, p + 6, 2);
+    memcpy(&sl, p + 8, 4);
+    /* pl_note_library writes what and the name at 255 bytes at most. */
+    return wl <= 255 && nl && nl <= 255 && sl && (uint64_t)PL_L_HEAD + wl + nl + sl == len;
+}
+
+/* The identity a record adds to the set. */
+static uint64_t pl_record_id(const uint8_t *p, uint32_t len)
+{
+    uint64_t ident;
+    if (p[0] == 'L') {
+        memcpy(&ident, p + 12, 8);
+    } else {
+        ident = fnv64(FNV64_INIT, p, len);
+        if (!ident)
+            ident = 1;
+    }
+    return ident;
+}
+
+typedef struct {
+    id<MTLDevice>   dev;
+    id<MTLFunction> vs_pass, fs_basic;   /* the base library's, as init built them */
+    uint64_t        vs_pass_id, fs_basic_id;
+    uint8_t        *data;                /* the records (validated), malloc'd */
+    size_t          len;
+    char            path[1100];
+} PreloadJob;
+
+/* The preload's queue: build every listed library with compile_fn's rename
+ * and options, then every listed pipeline from them with pso_build; keep
+ * nothing. Nothing here touches the ack thread's state. */
+static void preload_run(void *ctx)
+{
+    PreloadJob *j = (PreloadJob *)ctx;
+    uint64_t t0 = prof_now();
+    unsigned nl = 0, np = 0, fails = 0, skipped = 0;
+    size_t off = 0;
+
+    @autoreleasepool {
+        NSMutableDictionary *fns = [[NSMutableDictionary alloc] init];
+        [fns setObject:j->vs_pass forKey:@(j->vs_pass_id)];
+        [fns setObject:j->fs_basic forKey:@(j->fs_basic_id)];
+        while (off + 8 <= j->len) {
+            const uint8_t *p = j->data + off + 8;
+            uint32_t len;
+            memcpy(&len, j->data + off, 4);
+            off += 8 + (size_t)len;
+            @autoreleasepool {
+                if (p[0] == 'L') {
+                    uint16_t wl, nlen;
+                    uint32_t sl;
+                    uint64_t ident;
+                    char what[256];
+                    NSString *name, *text;
+                    NSError *err = nil;
+                    id<MTLLibrary> lib;
+                    id<MTLFunction> fn = nil;
+                    memcpy(&wl, p + 4, 2);
+                    memcpy(&nlen, p + 6, 2);
+                    memcpy(&sl, p + 8, 4);
+                    memcpy(&ident, p + 12, 8);
+                    memcpy(what, p + PL_L_HEAD, wl);
+                    what[wl] = 0;
+                    name = [[[NSString alloc] initWithBytes:p + PL_L_HEAD + wl length:nlen
+                                                   encoding:NSUTF8StringEncoding] autorelease];
+                    text = [[[NSString alloc] initWithBytes:p + PL_L_HEAD + wl + nlen length:sl
+                                                   encoding:NSUTF8StringEncoding] autorelease];
+                    if (name && text) {
+                        text = sh_nonce_rename(text, &name);
+                        lib = metal_compile_library(j->dev, text, what, &err);
+                        if (lib) {
+                            fn = [lib newFunctionWithName:name];
+                            [lib release];
+                        }
+                    }
+                    if (fn) {
+                        [fns setObject:fn forKey:@(ident)];
+                        [fn release];
+                        nl++;
+                    } else {
+                        fails++;
+                    }
+                } else {
+                    uint64_t vid, fid;
+                    uint32_t key[6];
+                    id<MTLFunction> vs, fs;
+                    id<MTLRenderPipelineState> pso;
+                    memcpy(&vid, p + 4, 8);
+                    memcpy(&fid, p + 12, 8);
+                    memcpy(key, p + 20, 24);
+                    vs = [fns objectForKey:@(vid)];
+                    fs = [fns objectForKey:@(fid)];
+                    if (vs && fs) {
+                        pso = pso_build(j->dev, vs, fs, key, NULL);
+                        if (pso) {
+                            [pso release];
+                            np++;
+                        } else {
+                            fails++;
+                        }
+                    } else {
+                        skipped++;
+                    }
+                }
+            }
+        }
+        [fns release];
+    }
+    fprintf(stderr, LOGP "preload: %u libraries, %u pipelines in %.0f ms (%s)",
+            nl, np, (prof_now() - t0) / 1e6, j->path);
+    if (fails || skipped)
+        fprintf(stderr, "; %u failed, %u pipelines without their functions", fails, skipped);
+    fputc('\n', stderr);
+    [j->dev release];
+    [j->vs_pass release];
+    [j->fs_basic release];
+    free(j->data);
+    free(j);
+}
+
+/* Where the list lives, per RECOMP_METAL_PRELOAD; 0 = off. */
+static int pl_resolve(char *path, size_t n)
+{
+    const char *e = recomp_env(RENV_METAL_PRELOAD);
+    shader_cache_env_kind kind = shader_cache_env(e);
+    shader_cache probe;
+    char dir[1024];
+
+    if (kind == SHADER_CACHE_ENV_OFF)
+        return 0;
+    if (kind == SHADER_CACHE_ENV_RELATIVE) {
+        fprintf(stderr, LOGP "preload: off (RECOMP_METAL_PRELOAD=%s is not an absolute"
+                " path)\n", e);
+        return 0;
+    }
+    if (kind == SHADER_CACHE_ENV_DIR) {
+        const char *slash = strrchr(e, '/');
+        size_t dl = slash ? (size_t)(slash - e) : 0;
+        if (snprintf(path, n, "%s", e) >= (int)n || dl >= sizeof dir)
+            return 0;
+        memcpy(dir, e, dl);
+        dir[dl ? dl : 1] = 0;
+        if (!dl)
+            dir[0] = '/';
+    } else {
+        /* Beside the D3D11 backend's dxbc, under no name a guest path maps to. */
+        if (!xbox_path_shader_cache(dir, sizeof dir - 16))
+            return 0;
+        strcat(dir, "/metal");
+        if (snprintf(path, n, "%s/preload.bin", dir) >= (int)n)
+            return 0;
+    }
+    if (!shader_cache_init(&probe, dir)) {   /* mkdir -p, and a write probe */
+        fprintf(stderr, LOGP "preload: off (cannot make or write %s)\n", dir);
+        return 0;
+    }
+    return 1;
+}
+
+/* On the ack thread, from init once the device and the base library are
+ * up: open the list (made or repaired), take its records into the set and
+ * queue the preload with a copy of them. */
+static void preload_start(void)
+{
+    uint8_t *buf = NULL;
+    long size;
+    size_t off, end = 0;
+    FILE *f;
+    uint64_t vs_pass_id, fs_basic_id;
+    uint32_t ver;
+    int fresh = 0;
+
+    sh_env();
+    if (!pl_resolve(s_pl_path, sizeof s_pl_path))
+        return;
+    if (!(f = fopen(s_pl_path, "r+b")) && !(f = fopen(s_pl_path, "w+b"))) {
+        fprintf(stderr, LOGP "preload: off (cannot open %s)\n", s_pl_path);
+        return;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0)
+        size = 0;
+    if (size >= (long)PL_HEAD && size <= (long)(PL_MAX_RECORDS * (8u + 64u * 1024u))
+     && (buf = (uint8_t *)malloc((size_t)size)) != NULL) {
+        rewind(f);
+        if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+            free(buf);
+            buf = NULL;
+        }
+    }
+    if (buf) {
+        memcpy(&ver, buf + 8, 4);
+        fresh = memcmp(buf, PL_MAGIC, 8) != 0 || ver != PL_VERSION;
+    } else {
+        fresh = 1;
+    }
+    if (!fresh) {
+        for (off = PL_HEAD; off + 8 <= (size_t)size && s_pl_n < PL_MAX_RECORDS; ) {
+            uint32_t len, ck;
+            memcpy(&len, buf + off, 4);
+            memcpy(&ck, buf + off + 4, 4);
+            if (len < 1 || len > PL_MAX_PAYLOAD || len > (size_t)size - off - 8
+             || fnv(buf + off + 8, len) != ck || !pl_record_ok(buf + off + 8, len))
+                break;
+            pl_set_add(pl_record_id(buf + off + 8, len));
+            s_pl_n++;
+            off += 8 + (size_t)len;
+        }
+        end = off;
+        if (end < (size_t)size) {   /* a cut-short tail: appends go after the last good record */
+            fflush(f);
+            if (ftruncate(fileno(f), (off_t)end) != 0)
+                fresh = 1;
+        }
+    }
+    if (fresh) {
+        uint8_t head[PL_HEAD];
+        s_pl_n = 0;
+        memset(s_pl_set, 0, sizeof s_pl_set);
+        end = 0;
+        memcpy(head, PL_MAGIC, 8);
+        ver = PL_VERSION;
+        memcpy(head + 8, &ver, 4);
+        fflush(f);
+        rewind(f);
+        if (ftruncate(fileno(f), 0) != 0 || fwrite(head, 1, PL_HEAD, f) != PL_HEAD
+         || fflush(f) != 0) {
+            fprintf(stderr, LOGP "preload: off (cannot write %s)\n", s_pl_path);
+            fclose(f);
+            free(buf);
+            return;
+        }
+    }
+    fseek(f, 0, SEEK_END);
+    s_pl_file = f;
+    s_pl_on = 1;
+
+    /* The base library's two: their pipelines are listed like the others. */
+    vs_pass_id = pl_fn_identity("vs_pass", s_msl, sizeof s_msl - 1);
+    fs_basic_id = pl_fn_identity("fs_basic", s_msl, sizeof s_msl - 1);
+    pl_fn_note(s_vs_pass, vs_pass_id);
+    pl_fn_note(s_fs_basic, fs_basic_id);
+
+    if (end > PL_HEAD) {
+        PreloadJob *j = (PreloadJob *)calloc(1, sizeof *j);
+        if (j && (j->data = (uint8_t *)malloc(end - PL_HEAD)) != NULL) {
+            dispatch_queue_attr_t at = dispatch_queue_attr_make_with_qos_class(
+                DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+            dispatch_queue_t q = dispatch_queue_create("xboxrecomp.metal.preload", at);
+            memcpy(j->data, buf + PL_HEAD, end - PL_HEAD);
+            j->len = end - PL_HEAD;
+            j->dev = [s_dev retain];
+            j->vs_pass = [s_vs_pass retain];
+            j->fs_basic = [s_fs_basic retain];
+            j->vs_pass_id = vs_pass_id;
+            j->fs_basic_id = fs_basic_id;
+            snprintf(j->path, sizeof j->path, "%s", s_pl_path);
+            dispatch_async_f(q, j, preload_run);
+            dispatch_release(q);
+        } else {
+            free(j);
+        }
+    }
+    free(buf);
 }
 
 /* ---- depth / stencil state ---------------------------------------------------

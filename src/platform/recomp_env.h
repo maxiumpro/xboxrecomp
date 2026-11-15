@@ -129,6 +129,7 @@ extern "C" {
     X(HDD_DIR,           CONFIG, "RECOMP_HDD_DIR",           NULL, "emulated hard disk: partition images, saves, caches (default: <data>/xboxrecomp/<title id>)") \
     X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA/CACHE") \
     X(DXBC_CACHE,        CONFIG, "RECOMP_DXBC_CACHE",        NULL, "D3D11 compiled-shader (DXBC) cache: on (default, <hdd dir>/ShaderCache/dxbc), 0/off/false/no: off, or an absolute directory") \
+    X(METAL_PRELOAD,     CONFIG, "RECOMP_METAL_PRELOAD",     NULL, "Metal runtime-shader preload list (the shaders and pipelines a run built, built again on a background thread at the next start): on (default, <hdd dir>/ShaderCache/metal/preload.bin), 0/off/false/no: off, or an absolute file path") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "vblank interrupt: unset, empty or 0 off (default); paced the 60 Hz schedule with the KickOff ack watch; any other value the plain tick, which becomes the schedule when RECOMP_DISPATCH_GATE or RECOMP_FLIP_PACING is on") \
     X(TITLE_KEVENTS,     CONFIG, "RECOMP_TITLE_KEVENTS",     NULL, "1: a KEVENT the title builds itself gets a host event (upstream, default off)") \
