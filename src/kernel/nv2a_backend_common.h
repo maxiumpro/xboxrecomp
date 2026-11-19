@@ -1735,6 +1735,9 @@ unsigned nv2a_host_opts_apply(void);
 uint32_t nv2a_host_opts_gen(void);
 /* render_scale as a factor: 1 when unset. */
 unsigned nv2a_host_render_scale(void);
+/* The factor for a render target of guest size w x h: render_scale, or 1
+ * for a size RECOMP_RENDER_NATIVE_TARGETS lists. */
+unsigned nv2a_host_scale_for(uint32_t w, uint32_t h);
 
 /* The stages of a draw that a later stage reads as its input
  * (OTHER_STAGE_INPUT): BUMPENVMAP(_LUMINANCE)'s offsets, the dot-product

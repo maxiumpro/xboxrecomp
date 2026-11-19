@@ -875,7 +875,7 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
     unsigned n;
 
     pad = nv2a_host_pad(w, h);
-    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_render_scale(), D3D11_MAX_DIM, &hw, &hh);
+    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_scale_for(w, h), D3D11_MAX_DIM, &hw, &hh);
     memset(&td, 0, sizeof td);
     td.Width = hw;
     td.Height = hh;
@@ -1029,7 +1029,7 @@ static RenderTarget *surface(void)
             rt_release(free_rt);
     }
     free_rt->pad = nv2a_host_pad(w, h);
-    free_rt->n = nv2a_host_size(w + 2u * free_rt->pad, h, nv2a_host_render_scale(),
+    free_rt->n = nv2a_host_size(w + 2u * free_rt->pad, h, nv2a_host_scale_for(w, h),
                                 D3D11_MAX_DIM, &free_rt->hw, &free_rt->hh);
     {
         D3D11_TEXTURE2D_DESC td;
@@ -1168,7 +1168,7 @@ static DepthTarget *depth_target(UINT w, UINT h)
         dt_release(e);
     }
     e->pad = nv2a_host_pad(w, h);
-    e->n = nv2a_host_size(w + 2u * e->pad, h, nv2a_host_render_scale(), D3D11_MAX_DIM,
+    e->n = nv2a_host_size(w + 2u * e->pad, h, nv2a_host_scale_for(w, h), D3D11_MAX_DIM,
                           &e->hw, &e->hh);
     memset(&td, 0, sizeof td);
     td.Width = e->hw;

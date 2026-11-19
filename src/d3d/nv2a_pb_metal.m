@@ -686,7 +686,7 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
         dt_free(e);
     }
     e->pad = nv2a_host_pad(w, h);
-    e->n = nv2a_host_size(w + 2u * e->pad, h, nv2a_host_render_scale(), METAL_MAX_DIM,
+    e->n = nv2a_host_size(w + 2u * e->pad, h, nv2a_host_scale_for(w, h), METAL_MAX_DIM,
                           &e->hw, &e->hh);
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
                                                             width:e->hw height:e->hh mipmapped:NO];
@@ -777,7 +777,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     int keep;
 
     pad = nv2a_host_pad(w, h);
-    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
+    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_scale_for(w, h), METAL_MAX_DIM, &hw, &hh);
     keep = rt->pad == pad && rt->hw == (rt->w + 2u * pad) * n && rt->hh == rt->h * n;
     if (!keep)
         rt_sync(rt, rt->pitch);
@@ -930,7 +930,7 @@ static RenderTarget *surface(void)
         }
     }
     pad = nv2a_host_pad(w, h);
-    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
+    n = nv2a_host_size(w + 2u * pad, h, nv2a_host_scale_for(w, h), METAL_MAX_DIM, &hw, &hh);
     free_rt->tex = rt_texture_new(hw, hh);
     if (!free_rt->tex)
         return NULL;

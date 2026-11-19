@@ -4,6 +4,7 @@
  */
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"
+#include "recomp_env.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -1165,6 +1166,42 @@ const struct nv2a_host_opts *nv2a_host_opts(void)
 unsigned nv2a_host_render_scale(void)
 {
     return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;
+}
+
+/* RECOMP_RENDER_NATIVE_TARGETS: the listed guest sizes keep factor 1. Read
+ * once (the backends call this from the walker thread only). */
+unsigned nv2a_host_scale_for(uint32_t w, uint32_t h)
+{
+    static int n = -1;
+    static uint32_t tw[8], th[8];
+    unsigned s = nv2a_host_render_scale();
+    int i;
+
+    if (n < 0) {
+        const char *e = recomp_env(RENV_RENDER_NATIVE_TARGETS);
+        n = 0;
+        while (e && *e && n < 8) {
+            unsigned a, b;
+            int used = 0;
+            if (sscanf(e, "%ux%u%n", &a, &b, &used) != 2 || !a || !b)
+                break;
+            tw[n] = a;
+            th[n] = b;
+            n++;
+            e += used;
+            if (*e != ',')
+                break;
+            e++;
+        }
+        if (n)
+            fprintf(stderr, "[GPU] render.scale: %d target size%s kept at 1x"
+                    " (RECOMP_RENDER_NATIVE_TARGETS)\n", n, n == 1 ? "" : "s");
+    }
+    if (s > 1)
+        for (i = 0; i < n; i++)
+            if (w == tw[i] && h == th[i])
+                return 1;
+    return s;
 }
 
 unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
