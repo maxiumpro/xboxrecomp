@@ -1284,6 +1284,40 @@ unsigned nv2a_host_scale_for(uint32_t w, uint32_t h)
     return s;
 }
 
+/* RECOMP_DOF_SKIP: the guest sizes of the copies a title blurs for depth of
+ * field. Same list syntax as RECOMP_RENDER_NATIVE_TARGETS, read once (the
+ * backends call this from the walker thread only). */
+int nv2a_dof_skip_size(uint32_t w, uint32_t h)
+{
+    static int n = -1;
+    static uint32_t tw[8], th[8];
+    int i;
+
+    if (n < 0) {
+        const char *e = recomp_env(RENV_DOF_SKIP);
+        n = 0;
+        while (e && *e && n < 8) {
+            unsigned a, b;
+            int used = 0;
+            if (sscanf(e, "%ux%u%n", &a, &b, &used) != 2 || !a || !b)
+                break;
+            tw[n] = a;
+            th[n] = b;
+            n++;
+            e += used;
+            if (*e != ',')
+                break;
+            e++;
+        }
+        if (n)
+            fprintf(stderr, "[GPU] dof_skip: %d size(s)\n", n);
+    }
+    for (i = 0; i < n; i++)
+        if (w == tw[i] && h == th[i])
+            return 1;
+    return 0;
+}
+
 unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
                            uint32_t other_stage_input)
 {

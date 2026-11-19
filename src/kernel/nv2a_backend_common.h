@@ -1805,6 +1805,12 @@ unsigned nv2a_host_render_scale(void);
  * for a size RECOMP_RENDER_NATIVE_TARGETS lists. */
 unsigned nv2a_host_scale_for(uint32_t w, uint32_t h);
 
+/* 1 when w x h is a size RECOMP_DOF_SKIP lists: the half-size copies a title
+ * blurs and repaints over its far scene as depth of field. The backends skip
+ * that repaint (a draw into a larger target sampling such a target, depth
+ * test on, depth writes off). Read once. */
+int nv2a_dof_skip_size(uint32_t w, uint32_t h);
+
 /* The stages of a draw that a later stage reads as its input
  * (OTHER_STAGE_INPUT): BUMPENVMAP(_LUMINANCE)'s offsets, the dot-product
  * family's normal and DEPENDENT_AR/GB's coordinates (every mode from 8 on),
