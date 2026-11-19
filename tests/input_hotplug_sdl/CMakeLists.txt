@@ -24,8 +24,14 @@ add_executable(input_hotplug_sdl_test
     ${INPUT_SRC}/kbm_script.c)
 target_include_directories(input_hotplug_sdl_test PRIVATE ${INPUT_SRC} ${INPUT_SRC}/..)
 target_link_libraries(input_hotplug_sdl_test PRIVATE platform SDL3::SDL3 m)
+if(APPLE)
+    # xinput_device.c calls the wired GIP reader (gip_pad_mac.m); RECOMP_GIP=0
+    # below keeps a plugged-in pad out of the test's ports.
+    target_sources(input_hotplug_sdl_test PRIVATE ${INPUT_SRC}/gip_pad_mac.m)
+    target_link_libraries(input_hotplug_sdl_test PRIVATE "-framework IOKit" "-framework CoreFoundation")
+endif()
 enable_testing()
 add_test(NAME input_hotplug_sdl COMMAND input_hotplug_sdl_test)
 set_tests_properties(input_hotplug_sdl PROPERTIES
     SKIP_RETURN_CODE 77
-    ENVIRONMENT "SDL_VIDEO_DRIVER=dummy;SDL_AUDIO_DRIVER=dummy;SDL_JOYSTICK_HIDAPI=0;SDL_JOYSTICK_IOKIT=0;SDL_JOYSTICK_MFI=0")
+    ENVIRONMENT "SDL_VIDEO_DRIVER=dummy;SDL_AUDIO_DRIVER=dummy;SDL_JOYSTICK_HIDAPI=0;SDL_JOYSTICK_IOKIT=0;SDL_JOYSTICK_MFI=0;RECOMP_GIP=0")
