@@ -1168,6 +1168,16 @@ unsigned nv2a_host_render_scale(void)
     return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;
 }
 
+int nv2a_w_depth_allowed(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_W_DEPTH);
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 /* RECOMP_RENDER_NATIVE_TARGETS: the listed guest sizes keep factor 1. Read
  * once (the backends call this from the walker thread only). */
 unsigned nv2a_host_scale_for(uint32_t w, uint32_t h)

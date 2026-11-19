@@ -1426,9 +1426,12 @@ void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
  * vertex program (its output carries w: the vertex epilogue's zw) and
  * programs the combiners (the generated shader's W variant). Anything else
  * keeps the host's z/w, its early-Z and its stock shader text. */
+/* RECOMP_DEBUG=w_depth=0: 0 (diagnostic: the per-pixel W depth's cost). */
+int nv2a_w_depth_allowed(void);
 static inline int nv2a_w_depth_on(const struct nv2a_pb_vsh *v, int program, int combiners)
 {
-    return ((v->control0 >> 16) & 1u) && v->depth_enable && program && combiners;
+    return ((v->control0 >> 16) & 1u) && v->depth_enable && program && combiners
+           && nv2a_w_depth_allowed();
 }
 
 /* Polygon offset applies to this primitive: SET_POLY_OFFSET_FILL_ENABLE and
