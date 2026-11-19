@@ -153,6 +153,9 @@ const xbox_input_backend xbox_input_host_backend = {
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
+#ifdef __APPLE__
+#include "gip_pad_mac.h"
+#endif
 
 /* Hot-plug. A port holds one open controller for as long as SDL reports it
  * attached; ports never shift, so player 1 keeps port 0 while pads come and
@@ -219,6 +222,13 @@ _Static_assert(SDL_GAMEPAD_AXIS_LEFTX == XBOX_SDL_AXIS_LEFTX
                && SDL_GAMEPAD_AXIS_RIGHTY == XBOX_SDL_AXIS_RIGHTY
                && SDL_GAMEPAD_AXIS_RIGHT_TRIGGER == XBOX_SDL_AXIS_TRIGGERRIGHT,
                "XBOX_SDL_AXIS_* must match SDL_GamepadAxis");
+#ifdef __APPLE__
+/* gip_pad_mac.m fills this struct without pad_map.h (gip_pad_mac.h says
+ * why), indexed by SDL's enums, which the asserts above tie to XBOX_SDL_*. */
+_Static_assert(XBOX_GIP_BUTTON_COUNT == XBOX_SDL_BUTTON_COUNT
+               && XBOX_GIP_AXIS_COUNT == XBOX_SDL_AXIS_COUNT,
+               "gip_pad_mac.h's counts must match pad_map.h's");
+#endif
 
 static uint64_t sdl_now_ms(void)
 {
@@ -388,6 +398,11 @@ static void sdl_init(void)
 {
     /* Before the first SDL call: the old driver names still work. */
     xbox_sdl_env_compat();
+#ifdef __APPLE__
+    /* Wired Xbox One (GIP) pads SDL does not see (gip_pad_mac.m). Never
+     * blocks; RECOMP_GIP=0 turns it off. */
+    xbox_GipPadStart();
+#endif
     __atomic_store_n(&g_wanted, 1, __ATOMIC_RELEASE);
     pthread_mutex_lock(&g_slot_lock);
     if (!g_main_pump) {
@@ -439,6 +454,32 @@ static void sdl_read_pad(SDL_Gamepad *c, XBOX_HOST_SDL_GAMEPAD *pad)
         pad->axis[a] = SDL_GetGamepadAxis(c, (SDL_GamepadAxis)a);
 }
 
+#ifdef __APPLE__
+/* g_slot_lock held. The GIP pad (gip_pad_mac.m) answers on the first port
+ * with no SDL pad open: a DualSense on port 0 leaves it port 1, alone it is
+ * port 0. */
+static int gip_port_is(DWORD port)
+{
+    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        if (!g_slot[p].pad)
+            return (DWORD)p == port;
+    return 0;
+}
+
+/* g_slot_lock not held (the read is only a copy under the reader's mutex).
+ * The GIP pad through the SDL adapter, with no host-only buttons (its Guide
+ * is not decoded). */
+static DWORD gip_read_raw(InputRaw *raw)
+{
+    XBOX_HOST_SDL_GAMEPAD pad;
+
+    if (!xbox_GipPadRead(&pad))
+        return ERROR_DEVICE_NOT_CONNECTED;
+    xbox_PadRawSdl(&pad, 0, raw);
+    return ERROR_SUCCESS;
+}
+#endif
+
 static DWORD sdl_get_raw(DWORD port, InputRaw *raw, DWORD *packet, int extras)
 {
     SDL_Gamepad *c;
@@ -456,7 +497,16 @@ static DWORD sdl_get_raw(DWORD port, InputRaw *raw, DWORD *packet, int extras)
         c = NULL;
     }
     if (!c) {
+#ifdef __APPLE__
+        int gip = gip_port_is(port);
+#endif
         pthread_mutex_unlock(&g_slot_lock);
+#ifdef __APPLE__
+        if (gip && gip_read_raw(raw) == ERROR_SUCCESS) {
+            *packet = ++g_packet[port];
+            return ERROR_SUCCESS;
+        }
+#endif
         return ERROR_DEVICE_NOT_CONNECTED;
     }
     if (!g_main_pump)
@@ -499,7 +549,14 @@ static DWORD sdl_read_raw(DWORD port, InputRaw *raw)
         return XBOX_INPUT_BUSY;
     c = g_ready ? g_slot[port].pad : NULL;
     if (!c || !SDL_GamepadConnected(c)) {
+#ifdef __APPLE__
+        int gip = !c && gip_port_is(port);
+#endif
         pthread_mutex_unlock(&g_slot_lock);
+#ifdef __APPLE__
+        if (gip)
+            return gip_read_raw(raw);
+#endif
         return ERROR_DEVICE_NOT_CONNECTED;
     }
     sdl_read_pad(c, &pad);

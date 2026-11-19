@@ -18,6 +18,7 @@
 #   host_open.c     the menu's "Open exports folder": ShellExecuteW on
 #                   Windows, a request for the window's thread elsewhere
 #   host_open_sdl.c that request through SDL_OpenURL (POSIX)
+#   gip_pad_mac.m   wired Xbox One (GIP) pads SDL does not see, via IOKit (macOS)
 
 add_library(xbox_input STATIC
     pad_map.c
@@ -55,6 +56,13 @@ else()
     target_sources(xbox_input PRIVATE keyboard_sdl.c mouse_sdl.c text_input_sdl.c
         host_open_sdl.c)
     target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3 m)
+    if(APPLE)
+        # Wired Xbox One (GIP) pads SDL does not see, read through IOKit's
+        # USB user client (gip_pad_mac.m; OBJC is enabled at the top level).
+        target_sources(xbox_input PRIVATE gip_pad_mac.m)
+        target_link_libraries(xbox_input PUBLIC
+            "-framework IOKit" "-framework CoreFoundation")
+    endif()
 endif()
 
 if(MSVC)
