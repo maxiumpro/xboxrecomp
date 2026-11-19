@@ -22,7 +22,10 @@ else()
         target_sources(xbox_video PRIVATE fb_present_metal.m)
         target_link_libraries(xbox_video PUBLIC
             "-framework Metal" "-framework QuartzCore" "-framework CoreGraphics"
-            "-framework Foundation" "-framework AppKit")
+            "-framework Foundation" "-framework AppKit"
+            # RECOMP_METAL_UPSCALE=metalfx (fb_present_metal.m); weak, so the
+            # binary still starts where MetalFX is missing.
+            "-weak_framework MetalFX")
         if(XBOXRECOMP_ENHANCE)
             # present.shader's Metal chain (librashader.h, loaded at run time).
             target_include_directories(xbox_video PRIVATE

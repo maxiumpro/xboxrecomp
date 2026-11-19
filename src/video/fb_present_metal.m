@@ -47,6 +47,7 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <SDL3/SDL.h>
@@ -696,6 +697,99 @@ static libra_mtl_filter_chain_t chain_get(void)
 }
 #endif /* XBOXRECOMP_ENHANCE */
 
+/* RECOMP_METAL_UPSCALE=metalfx: the composed frame (the slot: the guest's
+ * size times render.scale, HUD included) is upscaled to the letterboxed
+ * rectangle by MetalFX's spatial scaler instead of the linear blit, then
+ * drawn 1:1 like present.shader's output. Off by default. The blit stays
+ * when MetalFX is missing (before macOS 13, or a device it does not
+ * support), when the rectangle is not larger than the frame, with
+ * display.overscan (the scaler reads the whole frame) and with
+ * present.shader. The slot is shared storage, so it is copied into a
+ * private texture the scaler reads. Main thread only, like the rest. */
+static int s_fx_want = -1;
+static id s_fx;                         /* id<MTLFXSpatialScaler>, retained */
+static id<MTLTexture> s_fx_in, s_fx_out;
+static uint32_t s_fx_iw, s_fx_ih, s_fx_ow, s_fx_oh;
+static int s_fx_ov_said;
+
+static int fx_wanted(void)
+{
+    if (s_fx_want < 0) {
+        const char *e = getenv("RECOMP_METAL_UPSCALE");
+        s_fx_want = e && !strcmp(e, "metalfx");
+    }
+    return s_fx_want;
+}
+
+static void fx_off(const char *why)
+{
+    fprintf(stderr, "[METALFX] off: %s; the linear blit presents\n", why);
+    s_fx_want = 0;
+}
+
+/* The scaler for iw x ih -> ow x oh with its two textures, made again when a
+ * size changed (a command buffer in flight keeps the old ones); nil when
+ * MetalFX cannot run here, which also turns the option off. */
+static id fx_get(uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh)
+{
+    if (s_fx && s_fx_iw == iw && s_fx_ih == ih && s_fx_ow == ow && s_fx_oh == oh)
+        return s_fx;
+    [s_fx release];
+    [s_fx_in release];
+    [s_fx_out release];
+    s_fx = nil;
+    s_fx_in = s_fx_out = nil;
+    if (@available(macOS 13.0, *)) {
+        MTLFXSpatialScalerDescriptor *sd;
+        id<MTLFXSpatialScaler> sc;
+        MTLTextureDescriptor *td;
+
+        if (![MTLFXSpatialScalerDescriptor supportsDevice:s_dev]) {
+            fx_off("the device has no MetalFX spatial scaler");
+            return nil;
+        }
+        sd = [[MTLFXSpatialScalerDescriptor alloc] init];
+        sd.inputWidth = iw;
+        sd.inputHeight = ih;
+        sd.outputWidth = ow;
+        sd.outputHeight = oh;
+        sd.colorTextureFormat = MTLPixelFormatBGRA8Unorm;
+        sd.outputTextureFormat = MTLPixelFormatBGRA8Unorm;
+        /* The slot holds gamma-encoded SDR (the layer is sRGB). */
+        sd.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        sc = [sd newSpatialScalerWithDevice:s_dev];
+        [sd release];
+        if (!sc) {
+            fx_off("the scaler could not be made");
+            return nil;
+        }
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                width:iw height:ih mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate;
+        td.usage = sc.colorTextureUsage | MTLTextureUsageShaderRead;
+        s_fx_in = [s_dev newTextureWithDescriptor:td];
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                width:ow height:oh mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate;
+        td.usage = sc.outputTextureUsage | MTLTextureUsageShaderRead;
+        s_fx_out = [s_dev newTextureWithDescriptor:td];
+        if (!s_fx_in || !s_fx_out) {
+            [sc release];
+            fx_off("its textures could not be made");
+            return nil;
+        }
+        s_fx = sc;
+        s_fx_iw = iw;
+        s_fx_ih = ih;
+        s_fx_ow = ow;
+        s_fx_oh = oh;
+        fprintf(stderr, "[METALFX] spatial %ux%u -> %ux%u\n", iw, ih, ow, oh);
+        return s_fx;
+    }
+    fx_off("MetalFX needs macOS 13");
+    return nil;
+}
+
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 uint32_t pad, int filter, const char *shot_path, uint32_t flip,
                 const struct nv2a_ovl_list *const *layers, int nlayers)
@@ -713,6 +807,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         unsigned ov = nv2a_host_opts()->overscan;
         CGSize cur = s_layer.drawableSize;
         int internal = s_internal;
+        int fx = fx_wanted(), scaled = 0;
 #ifdef XBOXRECOMP_ENHANCE
         libra_mtl_filter_chain_t chain = NULL;
         int chained = 0;
@@ -735,7 +830,19 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
             s_chain_ov_said = 1;
             ov = 0;
         }
+        if (chain)
+            fx = 0;
 #endif
+        if (fx && ov) {
+            if (!s_fx_ov_said)
+                fprintf(stderr, "[METALFX] off while display.overscan=%u (the"
+                        " scaler reads the whole frame)\n", ov);
+            s_fx_ov_said = 1;
+            fx = 0;
+        }
+        /* The scaler writes window pixels: the drawable must be the window's. */
+        if (fx)
+            internal = 0;
 
         /* Checked every present, not only on resize events: a move between
          * displays of another scale need not arrive as SIZE_CHANGED. Under
@@ -791,6 +898,33 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 whole = 1;
                 if (!ov || filter == NV2A_PRESENT_INTEGER)
                     filter = NV2A_PRESENT_NEAREST;
+            }
+            if (fx && r.w > (int)fw && r.h > (int)fh
+                && fx_get(fw, fh, (uint32_t)r.w, (uint32_t)r.h)) {
+                /* This pass only clears; the copy and the scaler run after
+                 * it, and the next pass draws the output 1:1 into the
+                 * rectangle before the overlay (present.shader's shape). */
+                id<MTLFXSpatialScaler> sc = (id<MTLFXSpatialScaler>)s_fx;
+                id<MTLBlitCommandEncoder> b;
+                MTLViewport vp = { r.x, r.y, r.w, r.h, 0.0, 1.0 };
+
+                [enc endEncoding];
+                b = [cb blitCommandEncoder];
+                [b copyFromTexture:s_slot[k] toTexture:s_fx_in];
+                [b endEncoding];
+                sc.colorTexture = s_fx_in;
+                sc.outputTexture = s_fx_out;
+                sc.inputContentWidth = fw;
+                sc.inputContentHeight = fh;
+                [sc encodeToCommandBuffer:cb];
+                rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                enc = [cb renderCommandEncoderWithDescriptor:rp];
+                [enc setRenderPipelineState:s_pso];
+                [enc setViewport:vp];
+                [enc setFragmentTexture:s_fx_out atIndex:0];
+                [enc setFragmentSamplerState:s_smp[0] atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                scaled = 1;
             }
 #ifdef XBOXRECOMP_ENHANCE
             if (chain && r.w > 0 && r.h > 0
@@ -863,9 +997,9 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 }
                 chained = 1;
             }
-            if (!chained && r.w > 0 && r.h > 0) {
+            if (!chained && !scaled && r.w > 0 && r.h > 0) {
 #else
-            if (r.w > 0 && r.h > 0) {
+            if (!scaled && r.w > 0 && r.h > 0) {
 #endif
                 MTLViewport vp = { r.x, r.y, r.w, r.h, 0.0, 1.0 };
                 int lin = filter == NV2A_PRESENT_LINEAR
