@@ -4970,7 +4970,13 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
     if (s_dev && (s_presents == 1 || s_presents % 60 == 0))
         mem_stats_gpu_note("metal", (uint64_t)[s_dev currentAllocatedSize], MEM_STATS_NA);
     flip_log(surface_offset, rt);
-    if (s_presents == 1 || (s_presents % 300) == 0)
+    /* Running totals every 300 presents only under the present_stats trace
+     * (as in nv2a_pb_d3d11.c: printed by default they cost the frame). */
+    static int stats_on = -1;
+    if (stats_on < 0)
+        stats_on = recomp_env_on(RENV_PRESENT_STATS);
+    const int periodic = s_presents == 1 || (stats_on && (s_presents % 300) == 0);
+    if (periodic)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"
                 " %llu draws (%llu vertex-program), %llu skipped, %llu culled,"
                 " %llu texture uploads, %llu rehashes, %llu write-backs (%s),"
@@ -4998,11 +5004,11 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_window_presents,
                 s_layer ? "CAMetalLayer slots" : "texture readback",
                 (unsigned long long)s_flushes, (unsigned long long)s_report_commits);
-    if ((s_presents == 1 || (s_presents % 300) == 0) && (s_blits_gpu || s_blits_guest))
+    if (periodic && (s_blits_gpu || s_blits_guest))
         fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
                 " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
                 (unsigned long long)s_blits_guest);
-    if (s_zt_binds && (s_presents % 300) == 0)
+    if (s_zt_binds && stats_on && (s_presents % 300) == 0)
         fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
                 (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);
     if (!always && rt && addr && pitch)
