@@ -6759,7 +6759,14 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     flip_log(surface_offset);
     if (s_presents == 1 || s_presents % 60 == 0)
         gpu_mem_note();
-    if (s_presents == 1 || (s_presents % 300) == 0)
+    /* The running totals every 300 presents only under the present_stats
+     * trace: printed by default they cost the frame they land on
+     * (~30 ms on Windows, measured: every 300th flip a 45-50 ms interval). */
+    static int stats_on = -1;
+    if (stats_on < 0)
+        stats_on = recomp_env_on(RENV_PRESENT_STATS);
+    const int periodic = s_presents == 1 || (stats_on && (s_presents % 300) == 0);
+    if (periodic)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
                 " %llu clears, %llu draws, %llu skipped, %llu culled, %llu texture uploads,"
                 " %llu rehashes, %llu combiner shaders, %llu zclears,"
@@ -6778,21 +6785,21 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops,
                 (unsigned long long)s_evict_lost, (unsigned long long)s_grows,
                 (unsigned long long)s_partial_clears);
-    if (s_zt_binds && (s_presents % 300) == 0)
+    if (s_zt_binds && stats_on && (s_presents % 300) == 0)
         fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
                 (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);
-    if (s_presents == 1 || (s_presents % 300) == 0)
+    if (periodic)
         fprintf(stderr, LOGP "shaders: %u compiled (%.1f ms), %u from the cache (%.1f ms),"
                 " %u cache misses, %u damaged entries, %u failed stores\n",
                 s_sh_compiled, s_sh_compile_ms, s_sh_cached, s_sh_cached_ms,
                 s_shc.misses, s_shc.corrupt, s_shc.store_fails);
-    if (s_presents == 1 || (s_presents % 300) == 0)
+    if (periodic)
         fprintf(stderr, LOGP "blend: %llu draws with a constant factor,"
                 " %u SET_BLEND_COLOR writes (last 0x%08X)\n",
                 (unsigned long long)s_draws_bconst,
                 nv2a_pb_gpu_state()->blend_color_writes,
                 nv2a_pb_gpu_state()->blend_color);
-    if ((s_presents == 1 || (s_presents % 300) == 0) && (s_blits_gpu || s_blits_guest))
+    if (periodic && (s_blits_gpu || s_blits_guest))
         fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
                 " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
                 (unsigned long long)s_blits_guest);
