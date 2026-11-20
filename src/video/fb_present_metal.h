@@ -28,4 +28,16 @@ int   fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
  * present path. 1 when the level changed. */
 int   fbm_window_level(SDL_Window *win, int top);
 
+/* present.fullscreen_mode=native (fb_present_sdl.c): the desktop's display
+ * mode, kept in a file while a fullscreen window holds another, so a run
+ * that never puts it back is undone at the next start. save: the mode of
+ * win's display now, called before the switch; a save still outstanding is
+ * kept, since it holds the desktop's and the display may be native by now.
+ * 1 when the file holds it, with the native pixel size the switch takes.
+ * restore: reads the file and deletes it; only when the display is still at
+ * that native size, sets the saved mode with Core Graphics for the session
+ * (never kCGConfigurePermanently). why is for the log. */
+int   fbm_display_save(SDL_Window *win, unsigned long native_pw, unsigned long native_ph);
+void  fbm_display_restore(const char *why);
+
 #endif

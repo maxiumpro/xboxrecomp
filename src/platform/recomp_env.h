@@ -86,6 +86,7 @@ extern "C" {
     X(DISPLAY_OVERSCAN,  CONFIG, "RECOMP_DISPLAY_OVERSCAN",  NULL, "enhancements: display.overscan, guest px cropped from each side edge at present (top and bottom in proportion), 0 (stock) to 64; ignored with a wide display.aspect") \
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
+    X(PRESENT_FULLSCREEN_MODE, CONFIG, "RECOMP_PRESENT_FULLSCREEN_MODE", NULL, "enhancements: present.fullscreen_mode, the display mode a macOS fullscreen takes: auto (default: native when the desktop is a 1x mode smaller than the panel), native (the panel's own 1x mode, the desktop's put back on leaving), desktop (the desktop's mode, as before); ignored elsewhere") \
     X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, sleep (default: lowered spin waits sleep) or spin (stock busy-wait, the console-original timing)") \
     X(PRESENT_SURFACE,   CONFIG, "RECOMP_PRESENT_SURFACE",   NULL, "enhancements: present.surface, auto (default), window, internal") \
     X(PRESENT_SHADER,    CONFIG, "RECOMP_PRESENT_SHADER",    NULL, "enhancements: present.shader, none (stock), crt-lottes, crt-lottes-fast, crt-hyllian, fsr, or a .slangp path") \

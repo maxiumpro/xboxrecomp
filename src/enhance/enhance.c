@@ -156,6 +156,8 @@ static const char *const s_surface[] = { "auto", "window", "internal", NULL };
 static const char *const s_onoff[] = { "off", "on", NULL };
 /* Indexes match enum nv2a_movie_mode. */
 static const char *const s_movie[] = { "black", "fit", "fill", NULL };
+/* Indexes match enum nv2a_fullscreen_mode. */
+static const char *const s_fs_mode[] = { "desktop", "native", "auto", NULL };
 
 int xbox_enhance_init(const char *root, const char *title)
 {
@@ -191,6 +193,10 @@ int xbox_enhance_init(const char *root, const char *title)
     /* Indexes match enum nv2a_present_filter. */
     o.present_filter = enhance_cfg_choice("present.filter", s_filters, NV2A_PRESENT_NEAREST);
     o.fullscreen = enhance_cfg_bool("present.fullscreen", 0);
+    /* Only the macOS presenter reads it (fb_present_sdl.c logs what it
+     * picks); read everywhere so the key is never reported unused. */
+    o.fullscreen_mode = enhance_cfg_choice("present.fullscreen_mode", s_fs_mode,
+                                           NV2A_FULLSCREEN_AUTO);
     /* How lowered guest spin waits wait (kernel_pacing.h): only titles
      * generated with --spin-waits have any. Set before the guest starts.
      * The default sleeps: the wait frees a host core and the frames and

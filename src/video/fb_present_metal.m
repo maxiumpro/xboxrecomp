@@ -57,6 +57,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "kernel/nv2a_backend_common.h"
 #ifdef XBOXRECOMP_ENHANCE
@@ -1093,6 +1096,150 @@ int fbm_window_level(SDL_Window *win, int top)
         return 0;
     [w setLevel:want];
     return 1;
+}
+
+/* SDL switches the display with CGDisplaySetDisplayMode (SDL_cocoamodes.m)
+ * and sets the desktop's mode back when the window leaves fullscreen, is
+ * minimised or destroyed, and when video quits. Apple's documentation is
+ * understood to say a mode set that way lasts only for the app's lifetime,
+ * reverting when the process ends; that is unverified: no macOS SDK header
+ * was at hand when this was written. The file covers whatever is left
+ * (a crash, a kill, the OS not reverting): it is written before the switch,
+ * deleted once the desktop's mode is back, and read at the next start. */
+#define DISPLAY_FMT "display=%u width=%lu height=%lu pixel_width=%lu pixel_height=%lu" \
+                    " refresh=%lf native_pixel_width=%lu native_pixel_height=%lu\n"
+static int s_display_saved;   /* the file holds this run's desktop mode */
+
+static int display_file(char *out, size_t n, int make)
+{
+    const char *home = getenv("HOME");
+
+    if (!home || !*home)
+        return 0;
+    if (make) {
+        snprintf(out, n, "%s/Library/Application Support/xboxrecomp", home);
+        mkdir(out, 0755);     /* most runs: EEXIST */
+    }
+    return snprintf(out, n, "%s/Library/Application Support/xboxrecomp/display-restore.txt",
+                    home) < (int)n;
+}
+
+int fbm_display_save(SDL_Window *win, unsigned long npw, unsigned long nph)
+{
+    @autoreleasepool {
+        NSWindow *w = (NSWindow *)SDL_GetPointerProperty(SDL_GetWindowProperties(win),
+                                                         SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+        NSNumber *num = [[[w screen] deviceDescription] objectForKey:@"NSScreenNumber"];
+        CGDirectDisplayID disp = num ? (CGDirectDisplayID)[num unsignedIntValue] : CGMainDisplayID();
+        CGDisplayModeRef m;
+        char path[1024];
+        FILE *f;
+        int ok = 0;
+
+        if (s_display_saved)
+            return 1;
+        if (!display_file(path, sizeof path, 1) || !(m = CGDisplayCopyDisplayMode(disp)))
+            return 0;
+        f = fopen(path, "w");
+        if (f) {
+            ok = fprintf(f, DISPLAY_FMT, (unsigned)disp, (unsigned long)CGDisplayModeGetWidth(m),
+                         (unsigned long)CGDisplayModeGetHeight(m),
+                         (unsigned long)CGDisplayModeGetPixelWidth(m),
+                         (unsigned long)CGDisplayModeGetPixelHeight(m),
+                         CGDisplayModeGetRefreshRate(m), npw, nph) > 0;
+            ok = fclose(f) == 0 && ok;
+            if (!ok)
+                unlink(path);
+        }
+        CGDisplayModeRelease(m);
+        s_display_saved = ok;
+        return ok;
+    }
+}
+
+void fbm_display_restore(const char *why)
+{
+    char path[1024];
+    unsigned disp = 0;
+    unsigned long w = 0, h = 0, pw = 0, ph = 0, npw = 0, nph = 0;
+    double hz = 0;
+    int got, done = 0;
+    FILE *f;
+    CGDisplayModeRef cur;
+
+    s_display_saved = 0;
+    if (!display_file(path, sizeof path, 0) || !(f = fopen(path, "r")))
+        return;               /* nothing kept: the usual case */
+    got = fscanf(f, DISPLAY_FMT, &disp, &w, &h, &pw, &ph, &hz, &npw, &nph);
+    fclose(f);
+    /* Gone before anything is tried: a restore that fails, or crashes,
+     * is not tried again at every start. */
+    unlink(path);
+    if (got != 8) {
+        fprintf(stderr, "[PRESENT] display mode: %s unreadable; deleted (%s)\n", path, why);
+        return;
+    }
+    cur = CGDisplayCopyDisplayMode(disp);
+    if (!cur) {
+        fprintf(stderr, "[PRESENT] display mode: display %u is gone; %lux%lu (%lux%lu px)"
+                " not put back (%s)\n", disp, w, h, pw, ph, why);
+        return;
+    }
+    done = CGDisplayModeGetPixelWidth(cur) == pw && CGDisplayModeGetPixelHeight(cur) == ph;
+    {
+        /* Only what this toolkit set is undone: a display at any other
+         * mode was changed by the user since, and that is theirs. */
+        unsigned long cpw = CGDisplayModeGetPixelWidth(cur), cph = CGDisplayModeGetPixelHeight(cur);
+
+        CGDisplayModeRelease(cur);
+        if (!done && (cpw != npw || cph != nph)) {
+            fprintf(stderr, "[PRESENT] display mode: display at %lux%lu px, not the native %lux%lu"
+                    " a run set; left as it is (%s)\n", cpw, cph, npw, nph, why);
+            return;
+        }
+    }
+    if (!done) {
+        /* With the duplicates the Displays settings hide, as SDL lists
+         * them; every match is tried, since SDL_cocoamodes.m finds some
+         * look-alikes that refuse to be set. For the session only: the
+         * user's saved configuration is never written. */
+        const void *k[] = { kCGDisplayShowDuplicateLowResolutionModes };
+        const void *v[] = { kCFBooleanTrue };
+        CFDictionaryRef opt = CFDictionaryCreate(NULL, k, v, 1, &kCFTypeDictionaryKeyCallBacks,
+                                                 &kCFTypeDictionaryValueCallBacks);
+        CFArrayRef all = CGDisplayCopyAllDisplayModes(disp, opt);
+        CFIndex i, n = all ? CFArrayGetCount(all) : 0;
+
+        for (i = 0; i < n && !done; i++) {
+            CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(all, i);
+            CGDisplayConfigRef cfg;
+
+            if (CGDisplayModeGetWidth(m) != w || CGDisplayModeGetHeight(m) != h
+                    || CGDisplayModeGetPixelWidth(m) != pw || CGDisplayModeGetPixelHeight(m) != ph
+                    || fabs(CGDisplayModeGetRefreshRate(m) - hz) > 0.01)
+                continue;
+            if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess)
+                break;
+            if (CGConfigureDisplayWithDisplayMode(cfg, disp, m, NULL) != kCGErrorSuccess)
+                CGCancelDisplayConfiguration(cfg);
+            else
+                done = CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession) == kCGErrorSuccess;
+        }
+        if (all)
+            CFRelease(all);
+        if (opt)
+            CFRelease(opt);
+        if (!done) {
+            fprintf(stderr, "[PRESENT] display mode: desktop %lux%lu (%lux%lu px) @%.0f not found"
+                    " or refused; display left as it is (%s)\n", w, h, pw, ph, hz, why);
+            return;
+        }
+        fprintf(stderr, "[PRESENT] display mode: desktop %lux%lu (%lux%lu px) @%.0f put back"
+                " (%s)\n", w, h, pw, ph, hz, why);
+        return;
+    }
+    fprintf(stderr, "[PRESENT] display mode: desktop %lux%lu (%lux%lu px) in place (%s)\n",
+            w, h, pw, ph, why);
 }
 
 #endif /* __APPLE__ */

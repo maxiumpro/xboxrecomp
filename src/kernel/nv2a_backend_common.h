@@ -1738,6 +1738,15 @@ enum nv2a_present_surface {
     NV2A_PRESENT_SURFACE_INTERNAL       /* swap chain = the frame; the compositor scales */
 };
 
+/* present.fullscreen_mode: the display mode a macOS fullscreen window takes
+ * (fb_present_sdl.c; ignored elsewhere). Read when the window goes
+ * fullscreen, with no NV2A_OPT_* bit. Zero is stock: the desktop's mode. */
+enum nv2a_fullscreen_mode {
+    NV2A_FULLSCREEN_DESKTOP = 0,        /* stock: borderless at the desktop's mode */
+    NV2A_FULLSCREEN_NATIVE,             /* the panel's own 1x mode while fullscreen */
+    NV2A_FULLSCREEN_AUTO                /* native only for a 1x desktop smaller than it */
+};
+
 struct nv2a_host_opts {
     unsigned render_scale;      /* 0 or 1 = guest size; 2..4 */
     unsigned aniso;             /* 0 = stock; 2..16: anisotropic filtering
@@ -1754,6 +1763,7 @@ struct nv2a_host_opts {
                                  * side edge at present, 0 = stock (nv2a_present_crop) */
     int      snap_2d;           /* render.snap_2d: above scale 1, 2D batches sample
                                  * on the guest grid (nv2a_snap_flat2d); 0 = off */
+    int      fullscreen_mode;   /* enum nv2a_fullscreen_mode */
 };
 
 /* pack_off bits: the whole pack, or one kind of entry (nv2a_tex_pack.h). */

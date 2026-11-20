@@ -13,6 +13,8 @@
  *   render.scale        1..4, internal resolution factor (Metal, D3D11)
  *   present.filter      nearest | linear | integer
  *   present.fullscreen  borderless desktop fullscreen at start
+ *   present.fullscreen_mode  auto | native | desktop: the display mode a
+ *                       macOS fullscreen takes (fb_present_sdl.c)
  *   present.pacing      sleep (the toolkit's default; a game may set its
  *                       own with enhance_cfg_set_code_default) | spin
  *                       (stock, the console-original timing): how lowered

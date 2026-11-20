@@ -85,6 +85,7 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("display.overscan", RENV_DISPLAY_OVERSCAN);
     enhance_cfg_bind_env("present.filter", RENV_PRESENT_FILTER);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);
+    enhance_cfg_bind_env("present.fullscreen_mode", RENV_PRESENT_FULLSCREEN_MODE);
     enhance_cfg_bind_env("present.pacing", RENV_PRESENT_PACING);
     enhance_cfg_bind_env("present.surface", RENV_PRESENT_SURFACE);
     enhance_cfg_bind_env("present.shader", RENV_PRESENT_SHADER);

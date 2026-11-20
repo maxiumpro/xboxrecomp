@@ -84,6 +84,7 @@
 #include "kernel/nv2a_backend_common.h"
 #include "window_title.h"
 #if defined(__APPLE__)
+#include <signal.h>
 #include <strings.h>
 #include "fb_present_metal.h"
 #endif
@@ -787,7 +788,142 @@ static void mac_fullscreen_level(SDL_Window *win, int full, int spaces_off)
         fprintf(stderr, "[PRESENT] macOS fullscreen: %s\n",
                 top ? "focused, above the menu bar" : "no focus, normal window level");
 }
+
+/* present.fullscreen_mode: the mode a fullscreen window takes. NULL is
+ * SDL's borderless desktop fullscreen at the desktop's mode, as always. A
+ * 1x desktop that macOS stretches to a larger panel (2048x1332 on a
+ * 2560x1664 Air) gives the layer the desktop's pixels, not the panel's;
+ * native takes the display's largest 1x mode instead, an exclusive mode SDL
+ * switches to while the window is fullscreen. SDL sets the desktop's back
+ * when the window leaves fullscreen, is destroyed, or is minimised, which
+ * SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS (left at its default, auto) does to
+ * an exclusive-mode window that loses focus. auto is native only for such a
+ * desktop; desktop is the old behaviour. Logged when the pick changes. */
+static const SDL_DisplayMode *mac_fullscreen_mode(SDL_Window *win, SDL_DisplayMode *out)
+{
+    static const char *const names[] = { "desktop", "native", "auto" };
+    static char said[160];
+    char line[160];
+    int want = nv2a_host_opts()->fullscreen_mode, n = 0, i, nat = 0;
+    SDL_DisplayID d = SDL_GetDisplayForWindow(win);
+    const SDL_DisplayMode *desk = d ? SDL_GetDesktopDisplayMode(d) : NULL;
+    SDL_DisplayMode **all = d && want != NV2A_FULLSCREEN_DESKTOP
+                          ? SDL_GetFullscreenDisplayModes(d, &n) : NULL;
+
+    /* Sorted largest first: the first 1x mode is the panel's own. */
+    for (i = 0; all && i < n && !nat; i++)
+        if (all[i]->pixel_density == 1.0f) {
+            *out = *all[i];
+            nat = 1;
+        }
+    SDL_free(all);
+    if (nat && want == NV2A_FULLSCREEN_AUTO
+            && !(desk && desk->pixel_density == 1.0f && (desk->w != out->w || desk->h != out->h)))
+        nat = 0;
+    if (nat)
+        snprintf(line, sizeof line, "native %dx%d@%.0f", out->w, out->h, out->refresh_rate);
+    else
+        snprintf(line, sizeof line, "desktop");
+    snprintf(line + strlen(line), sizeof line - strlen(line), " (desktop %dx%d%s, %s)",
+             desk ? desk->w : 0, desk ? desk->h : 0,
+             desk && desk->pixel_density != 1.0f ? " hidpi" : "",
+             want >= 0 && want < 3 ? names[want] : "?");
+    if (strcmp(line, said)) {
+        snprintf(said, sizeof said, "%s", line);
+        fprintf(stderr, "[PRESENT] fullscreen mode: %s\n", line);
+    }
+    return nat ? out : NULL;
+}
+
+/* A stop signal while the native mode is up. SDL_HINT_NO_SIGNAL_HANDLERS
+ * keeps SIGINT and SIGTERM at their default, which ends the process at
+ * once: macOS should drop the mode with it (fbm_display_restore), and the
+ * next start sets it back from the file if not. No SDL or Core Graphics
+ * call is async-signal-safe, so the handler only notes the signal; the
+ * main loop (awake every 100 ms) then closes the window as its close button
+ * would, SDL sets the desktop's mode back, and the signal is raised again
+ * under what was there before, so the run still ends as it always did. A
+ * second signal (the loop is stuck) does that at once. Installed only while
+ * the mode is up, so benches never see it; an ignored signal (nohup) stays
+ * ignored. */
+static const int s_stop_sig[3] = { SIGINT, SIGTERM, SIGHUP };
+static struct sigaction s_stop_old[3];
+static int s_stop_on[3];
+static volatile sig_atomic_t s_stop;
+
+static void stop_signal(int sig)
+{
+    int i;
+
+    if (!s_stop) {
+        s_stop = sig;
+        return;
+    }
+    for (i = 0; i < 3; i++)
+        if (s_stop_sig[i] == sig && s_stop_on[i])
+            sigaction(sig, &s_stop_old[i], NULL);
+    raise(sig);
+}
+
+static void stop_signals(int on)
+{
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        if (on && !s_stop_on[i]) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_handler = stop_signal;
+            sa.sa_flags = SA_RESTART;   /* it returns: other threads' calls go on */
+            sigemptyset(&sa.sa_mask);
+            if (sigaction(s_stop_sig[i], NULL, &s_stop_old[i]) == 0
+                    && s_stop_old[i].sa_handler != SIG_IGN
+                    && sigaction(s_stop_sig[i], &sa, NULL) == 0)
+                s_stop_on[i] = 1;
+        } else if (!on && s_stop_on[i]) {
+            /* Only if still ours: one installed since (pad_record) stays. */
+            struct sigaction cur;
+            if (sigaction(s_stop_sig[i], NULL, &cur) == 0 && cur.sa_handler == stop_signal)
+                sigaction(s_stop_sig[i], &s_stop_old[i], NULL);
+            s_stop_on[i] = 0;
+        }
+    }
+}
+
+/* The window is out of fullscreen (or gone): SDL has set the desktop's
+ * mode back; this checks it, deletes the file, and drops the handler. */
+static void mac_fullscreen_left(const char *why)
+{
+    fbm_display_restore(why);
+    stop_signals(0);
+}
 #endif
+
+/* Before a switch to fullscreen: the mode it takes. NULL, SDL3's borderless
+ * desktop fullscreen, but for macOS's native pick above, which saves the
+ * desktop's mode first and is not taken when that cannot be saved. */
+static void fullscreen_mode_set(SDL_Window *win)
+{
+#if defined(__APPLE__)
+    SDL_DisplayMode m;
+
+    if (mac_fullscreen_mode(win, &m)) {
+        if (!fbm_display_save(win, (unsigned long)(m.w * m.pixel_density),
+                              (unsigned long)(m.h * m.pixel_density))) {
+            fprintf(stderr, "[PRESENT] fullscreen mode: desktop (the desktop's mode cannot"
+                            " be saved to put it back)\n");
+        } else if (SDL_SetWindowFullscreenMode(win, &m)) {
+            stop_signals(1);
+            return;
+        } else {
+            fprintf(stderr, "[PRESENT] fullscreen mode: native refused (%s); desktop\n",
+                    SDL_GetError());
+            mac_fullscreen_left("native refused");
+        }
+    }
+#endif
+    SDL_SetWindowFullscreenMode(win, NULL);
+}
 
 /* SDL_PushEvent may be called from any thread. */
 static int post_quit(const char *why)
@@ -857,6 +993,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                             " (SDL_VIDEO_MAC_FULLSCREEN_SPACES in the environment)\n");
         spaces_off = !SDL_GetHintBoolean(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, true);
     }
+    /* A last run that held the native mode and never set the desktop's
+     * back (fullscreen_mode_set): before SDL reads the desktop's mode. */
+    fbm_display_restore("start");
 #endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[PRESENT] SDL video unavailable (%s); running headless\n",
@@ -883,7 +1022,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             win = SDL_CreateWindow(window_name(), win_w, 480 * scale,
                                    wflags | SDL_WINDOW_METAL);
             if (win && eo->fullscreen)
-                SDL_SetWindowFullscreenMode(win, NULL);
+                fullscreen_mode_set(win);
             if (!win)
                 snprintf(why, sizeof why, "%s", SDL_GetError());
             else if (fbm_create(win, vsync, s_shot_n > 0, why, sizeof why))
@@ -900,7 +1039,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         if (!s_layer) {
             win = SDL_CreateWindow(window_name(), win_w, 480 * scale, wflags);
             if (win && eo->fullscreen)
-                SDL_SetWindowFullscreenMode(win, NULL);
+                fullscreen_mode_set(win);
             ren = win ? SDL_CreateRenderer(win, NULL) : NULL;
             if (ren && vsync && !SDL_SetRenderVSync(ren, 1))
                 fprintf(stderr, "[PRESENT] renderer vsync unavailable (%s)\n",
@@ -911,6 +1050,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 if (win)
                     SDL_DestroyWindow(win);
                 SDL_QuitSubSystem(SDL_INIT_VIDEO);
+#if defined(__APPLE__)
+                mac_fullscreen_left("headless");
+#endif
                 return guest_main();
             }
         }
@@ -937,6 +1079,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         close_present(ren);
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
+#if defined(__APPLE__)
+        mac_fullscreen_left("headless");
+#endif
         return guest_main();
     }
     s_frame_event = s_guest_done_event + 1;
@@ -958,6 +1103,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         xbox_InputSetMainPump(0);
         close_present(ren);
         SDL_DestroyWindow(win);
+#if defined(__APPLE__)
+        mac_fullscreen_left("headless");
+#endif
         return guest_main();
     }
 
@@ -993,6 +1141,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     dirty = 1;
             } while (SDL_PollEvent(&ev));
         }
+#if defined(__APPLE__)
+        if (s_stop)
+            quit = 1;            /* stop_signal: close first, then stop */
+#endif
         /* The capture can change on the poll thread (the release key, a
          * script); relative mode has to be set here, on the window's. */
         xbox_InputSdlMouseSync(win);
@@ -1021,17 +1173,25 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             }
             if (eo->fullscreen != full) {
                 int want = eo->fullscreen;
-                /* NULL mode: borderless desktop, as at creation. A failed
-                 * switch keeps `full`, so the next gen change tries again. */
+                /* The mode as at creation. A failed switch keeps `full`,
+                 * so the next gen change tries again. */
                 if (want)
-                    SDL_SetWindowFullscreenMode(win, NULL);
+                    fullscreen_mode_set(win);
                 if (!SDL_SetWindowFullscreen(win, want)) {
                     fprintf(stderr, "[PRESENT] present.fullscreen=%s failed (%s)\n",
                             want ? "on" : "off", SDL_GetError());
+#if defined(__APPLE__)
+                    if (want)
+                        mac_fullscreen_left("fullscreen failed");
+#endif
                 } else {
                     full = want;
                     fprintf(stderr, "[PRESENT] present.fullscreen=%s (live)\n",
                             full ? "on" : "off");
+#if defined(__APPLE__)
+                    if (!want)
+                        mac_fullscreen_left("left fullscreen");
+#endif
                 }
                 dirty = 1;
             }
@@ -1265,6 +1425,15 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * until exit(), and must not start calling SDL_UpdateGamepads
      * while SDL is torn down under them. */
     SDL_QuitSubSystem(XBOX_PRESENT_SDL_QUIT);
+#if defined(__APPLE__)
+    mac_fullscreen_left("exit");
+    if (s_stop) {
+        /* stop_signals(0) put the old disposition back: the stop it was. */
+        fprintf(stderr, "[PRESENT] signal %d: window closed first, stopping\n", (int)s_stop);
+        fflush(stderr);
+        raise(s_stop);
+    }
+#endif
     if (quit)
         exit(0);
     return s_guest_rc;
