@@ -3430,7 +3430,12 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     key[34] = v->rc_fcw1;
     key[35] = modes;
     /* render.scale changes at run time: each scale class has its own text */
-    key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
+    /* RECOMP_DEBUG=metal_rect_snap0=1: timing probe, no nv2a_snap_uv (its
+     * dfdx/dfdy per stage) at any scale; misplaces 2D texels */
+    static int no_snap = -1;
+    if (no_snap < 0)
+        no_snap = recomp_env_on(RENV_METAL_RECT_SNAP0);
+    key[36] = (nv2a_host_render_scale() > 1 && !no_snap) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
             | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
             | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
             | (s_fs_mag ? 16u : 0u);   /* the trace's variant */
