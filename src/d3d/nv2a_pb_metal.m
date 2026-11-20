@@ -3391,14 +3391,18 @@ static int snap_lazy_now(void)
     static int mode = -1;
     if (mode < 0) {
         const char *e = recomp_env(RENV_METAL_SNAP_LAZY);
-        mode = !e ? 0 : !strcasecmp(e, "alt") ? 2 : !strcasecmp(e, "alt2") ? 4
+        /* V1 is the default (KFC-1340, 20-nov): the guard is equal by
+         * construction, the call is a no-op where .z is 0. 0/off: the old
+         * unconditional call. */
+        int off = e && (e[0] == '0' || !strcasecmp(e, "off"));
+        mode = !e ? 1 : off ? 0 : !strcasecmp(e, "alt") ? 2 : !strcasecmp(e, "alt2") ? 4
              : e[0] == '1' ? 1 : e[0] == '2' ? 3 : 0;
-        if (e && !mode)
+        if (e && !mode && !off)
             fprintf(stderr, LOGP "metal_snap_lazy=%s: not 1, alt, 2 or alt2, off\n", e);
         else if (mode >= 3)
             fprintf(stderr, LOGP "metal_snap_lazy=%s: nv2a_snap_uv only on stages with"
                     " tex_scale.z != 0, chosen per draw\n", e);
-        else if (mode)
+        else if (mode && e)
             fprintf(stderr, LOGP "metal_snap_lazy=%s: nv2a_snap_uv only where tex_scale.z != 0\n", e);
     }
     if (mode == 1 || (mode == 2 && !(s_presents & 1)))
@@ -3564,7 +3568,7 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
  * the device (thread-safe); nothing waits on it. */
 
 #define PL_MAGIC       "XRMTLPL\x1a"
-#define PL_VERSION     1u
+#define PL_VERSION     2u               /* 2: metal_snap_lazy=1 by default (20-nov) */
 #define PL_HEAD        12u               /* magic, version */
 #define PL_MAX_RECORDS 4096u
 #define PL_MAX_PAYLOAD (1u << 20)
