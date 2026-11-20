@@ -6329,6 +6329,121 @@ static void dbg_present(RenderTarget *rt)
 }
 #endif /* XBOXRECOMP_ENHANCE */
 
+/* RECOMP_DEBUG=metal_gpu_spin=1|alt|<us> (probe): Apple GPUs set their
+ * clock by how busy they are, and the flip waits for the frame, so the GPU
+ * idles while the CPU builds the next one. When on, the flip, after its
+ * wait, commits on a queue of its own one small dispatch (one threadgroup,
+ * a dependent FMA loop) that keeps the GPU busy for about that gap: 4 ms,
+ * or <us> when the value is 100 or more. Its length follows the last
+ * spin's GPU time, read at the next flip without waiting; a spin still
+ * running then skips this one. alt: only before even flips (the parity
+ * snap_lazy_now() sees in that frame), an in-run A/B. Never in s_prof_cmd
+ * and never timestamped: metal_prof and metal_gpu_blocks time only the
+ * frame's command buffers. Off: no queue, no kernel. */
+static const char s_spin_msl[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "kernel void nv2a_gpu_spin(device float *out [[buffer(0)]],\n"
+    "                          constant uint &n [[buffer(1)]],\n"
+    "                          uint tid [[thread_position_in_grid]])\n"
+    "{\n"
+    "    float a = 1.0f + float(tid) * 1e-6f;\n"
+    "    for (uint i = 0; i < n; i++)\n"
+    "        a = fma(a, 0.9999999f, 1e-7f);\n"
+    "    out[tid] = a;\n"
+    "}\n";
+#define SPIN_THREADS 32u
+#define SPIN_N_MIN   (1u << 10)
+#define SPIN_N_MAX   (1u << 26)
+
+static void gpu_spin_flip(void)
+{
+    static int mode = -1;   /* 0 off, 1 every flip, 2 alt */
+    static double target_us = 4000.0;
+    static uint32_t iters = 1u << 16;
+    static id<MTLCommandQueue> q;
+    static id<MTLComputePipelineState> pso;
+    static id<MTLBuffer> out;
+    static id<MTLCommandBuffer> last;
+    static struct { int flips, n, busy; double ms; } w;
+    id<MTLCommandBuffer> cb;
+    id<MTLComputeCommandEncoder> ce;
+
+    if (mode < 0) {
+        const char *e = recomp_env(RENV_METAL_GPU_SPIN);
+        long v = e ? strtol(e, NULL, 10) : 0;
+        int off = e && ((e[0] == '0' && !v) || !strcasecmp(e, "off"));
+        mode = !e || off ? 0 : !strcasecmp(e, "alt") ? 2 : v == 1 || v >= 100 ? 1 : 0;
+        if (v >= 100)
+            target_us = (double)v;
+        if (e && !mode && !off)
+            fprintf(stderr, LOGP "metal_gpu_spin=%s: not 1, alt or microseconds >= 100, off\n", e);
+        if (mode) {
+            NSError *err = nil;
+            id<MTLLibrary> lib = metal_compile_library(s_dev, [NSString stringWithUTF8String:s_spin_msl],
+                                                       "nv2a_gpu_spin", &err);
+            id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"nv2a_gpu_spin"] : nil;
+            if (fn)
+                pso = [s_dev newComputePipelineStateWithFunction:fn error:&err];
+            [fn release];
+            [lib release];
+            if (pso) {
+                q = [s_dev newCommandQueue];
+                out = [s_dev newBufferWithLength:SPIN_THREADS * sizeof(float)
+                                         options:MTLResourceStorageModePrivate];
+            }
+            if (!pso || !q || !out) {
+                fprintf(stderr, LOGP "metal_gpu_spin=%s: no spin kernel (%s), off\n", e,
+                        err ? [[err localizedDescription] UTF8String] : "?");
+                mode = 0;
+            } else {
+                fprintf(stderr, LOGP "metal_gpu_spin=%s: after each flip's wait a %u-thread"
+                        " spin on its own queue, target %.0f us of GPU time%s\n", e,
+                        SPIN_THREADS, target_us, mode == 2 ? " (alt: before even flips only)" : "");
+            }
+        }
+    }
+    if (!mode)
+        return;
+    if (++w.flips == 300) {
+        fprintf(stderr, LOGP "gpu spin over 300 flips: target %.0f us, mean spin %.3f ms, %u"
+                " iterations (%d spins timed, %d skipped while the last still ran)\n", target_us,
+                w.n ? w.ms / w.n : 0.0, iters, w.n, w.busy);
+        memset(&w, 0, sizeof w);
+    }
+    if (last) {
+        MTLCommandBufferStatus st = [last status];
+        if (st < MTLCommandBufferStatusCompleted) {
+            w.busy++;   /* still spinning: never stack spins, never wait */
+            return;
+        }
+        if (st == MTLCommandBufferStatusCompleted) {
+            double us = ([last GPUEndTime] - [last GPUStartTime]) * 1e6, f, nn;
+            if (us > 0) {
+                f = target_us / us;
+                f = f < 0.5 ? 0.5 : f > 2.0 ? 2.0 : f;   /* damped: the clock moves with it */
+                nn = (double)iters * f;
+                iters = nn < SPIN_N_MIN ? SPIN_N_MIN : nn > SPIN_N_MAX ? SPIN_N_MAX : (uint32_t)nn;
+                w.n++;
+                w.ms += us / 1e3;
+            }
+        }
+        [last release];
+        last = nil;
+    }
+    if (mode == 2 && ((s_presents + 1) & 1))   /* the frame built next is odd */
+        return;
+    cb = [q commandBuffer];
+    ce = [cb computeCommandEncoder];
+    [ce setComputePipelineState:pso];
+    [ce setBuffer:out offset:0 atIndex:0];
+    [ce setBytes:&iters length:sizeof iters atIndex:1];
+    [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(SPIN_THREADS, 1, 1)];
+    [ce endEncoding];
+    [cb commit];
+    last = [cb retain];
+}
+
 static void metal_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
@@ -6419,6 +6534,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 if (addr == rt->addr && pitch == rt->pitch)
                     rt_own_reset(rt);
             }
+            /* after the flip's own GPU work (present blit, readbacks) */
+            gpu_spin_flip();   /* RECOMP_DEBUG=metal_gpu_spin; off: returns */
         }
     }
     s_presents++;
