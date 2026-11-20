@@ -245,6 +245,201 @@ static uint64_t s_tex_mip_uploads;   /* uploads with more than one level */
 static uint64_t s_vb_native, s_vb_expanded;  /* vertex bytes copied / made */
 static uint64_t s_draws_prog, s_draws_tex;   /* with a vertex program / a texture */
 
+/* ---- RECOMP_TRACE=d3d11_gpu: the frame's GPU time ------------------------
+ *
+ * What a frame of Kung Fu Chaos costs the GPU here, to set beside Metal's
+ * metal_prof figure: the Vega 8 holds 16.7 ms frames at 2560x1920 where
+ * the M4 spends ~8.8 ms of GPU at 1920x1440, and the question is where the
+ * time goes. A TIMESTAMP_DISJOINT query brackets the frame, from its first
+ * clear, draw or blit (gq_mark) to just before Present (gq_end), with a
+ * TIMESTAMP at each end and one wherever the kind of work changes
+ * (nv2a_gpu_cat_draw; the present, the depth conversion). The queries are
+ * read without a flush up to GQ_FRAMES - 1 frames later; a frame still
+ * unread when its slot comes round again is dropped and counted, never
+ * waited for. End minus start is a span of the GPU's timeline, not busy
+ * time: a GPU waiting on a slow feed between draws counts the gaps too, so
+ * the figure is an upper bound on the frame's GPU work (Metal's
+ * GPUStartTime/GPUEndTime per command buffer has the same nature, but
+ * misses the gaps between its buffers). Off: one cached int read per draw,
+ * clear and flip. */
+#define GQ_FRAMES 8
+#define GQ_MARKS  48       /* start, the category changes, the end */
+#define GQ_WINDOW 300      /* flips per printed line */
+typedef struct {
+    ID3D11Query *dj;
+    ID3D11Query *ts[GQ_MARKS];
+    uint8_t      cat[GQ_MARKS];   /* the work from mark i to mark i + 1 */
+    int          n;               /* marks issued */
+    int          state;           /* 0 free, 1 recording, 2 waiting for its data */
+} GqFrame;
+static int     s_gq_on = -1;
+static GqFrame s_gq[GQ_FRAMES];
+static int     s_gq_cur = -1;     /* the slot recording, -1 between frames */
+static int     s_gq_cat;          /* the open span's category */
+static unsigned s_gq_next;
+static struct {
+    double   ms[GQ_WINDOW * 2];  /* the frames read in this window */
+    int      n;
+    double   cat_ms[NV2A_GCAT_N];
+    uint64_t dropped, disjoint, capped;
+    int      flips;
+} s_gqs;
+
+static int gq_on(void)
+{
+    if (s_gq_on < 0)
+        s_gq_on = recomp_env(RENV_D3D11_GPU) != NULL;
+    return s_gq_on;
+}
+
+/* One frame's data into the window, if it has landed: 1 when the slot is
+ * free again (read, or disjoint and thrown away). */
+static int gq_read(GqFrame *f)
+{
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+    UINT64 t[GQ_MARKS];
+    int i;
+
+    if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)f->dj, &dj, sizeof dj,
+                                    D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return 0;
+    for (i = 0; i < f->n; i++)
+        if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)f->ts[i], &t[i],
+                                        sizeof t[i], D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            return 0;
+    f->state = 0;
+    if (dj.Disjoint || !dj.Frequency || f->n < 2) {
+        s_gqs.disjoint++;
+        return 1;
+    }
+    if (s_gqs.n < (int)(sizeof s_gqs.ms / sizeof s_gqs.ms[0]))
+        s_gqs.ms[s_gqs.n++] = (double)(t[f->n - 1] - t[0]) * 1e3 / (double)dj.Frequency;
+    for (i = 0; i + 1 < f->n; i++)
+        if (t[i + 1] > t[i])
+            s_gqs.cat_ms[f->cat[i]] += (double)(t[i + 1] - t[i]) * 1e3 / (double)dj.Frequency;
+    return 1;
+}
+
+/* The frame's first GPU work: a free slot (the oldest unread one dropped
+ * if none), its disjoint begun and its start stamped. */
+static int gq_begin(void)
+{
+    GqFrame *f = &s_gq[s_gq_next % GQ_FRAMES];
+    D3D11_QUERY_DESC qd;
+    int i;
+
+    if (f->state == 2 && !gq_read(f)) {
+        f->state = 0;
+        s_gqs.dropped++;
+    }
+    if (!f->dj) {
+        qd.MiscFlags = 0;
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &f->dj)))
+            f->dj = NULL;
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        for (i = 0; f->dj && i < GQ_MARKS; i++)
+            if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &f->ts[i]))) {
+                f->ts[i] = NULL;
+                break;
+            }
+        if (!f->dj || i < GQ_MARKS) {
+            fprintf(stderr, LOGP "d3d11_gpu: no timestamp queries on this device: off\n");
+            s_gq_on = 0;
+            return 0;
+        }
+    }
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)f->dj);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)f->ts[0]);
+    f->n = 1;
+    f->state = 1;
+    s_gq_cur = (int)(s_gq_next % GQ_FRAMES);
+    return 1;
+}
+
+/* GPU work of kind cat is next (-1: whatever the open span is, for a clear
+ * or a blit): a new span when the kind changes. The frame's first span
+ * takes the first kind named, OTHER for a clear or blit. */
+static void gq_mark(int cat)
+{
+    GqFrame *f;
+    if (s_gq_cur < 0) {
+        if (!gq_begin())
+            return;
+        s_gq_cat = cat < 0 ? NV2A_GCAT_OTHER : cat;
+        s_gq[s_gq_cur].cat[0] = (uint8_t)s_gq_cat;
+        return;
+    }
+    if (cat < 0 || cat == s_gq_cat)
+        return;
+    f = &s_gq[s_gq_cur];
+    if (f->n >= GQ_MARKS - 1) {   /* the last one is the end's: the open span keeps the rest */
+        s_gqs.capped++;
+        return;
+    }
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)f->ts[f->n]);
+    f->cat[f->n] = (uint8_t)cat;
+    f->n++;
+    s_gq_cat = cat;
+}
+
+/* Just before Present: the frame's end stamped and its disjoint closed. */
+static void gq_end(void)
+{
+    GqFrame *f;
+    if (s_gq_cur < 0)
+        return;   /* nothing reached the GPU this frame */
+    f = &s_gq[s_gq_cur];
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)f->ts[f->n]);
+    f->n++;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)f->dj);
+    f->state = 2;
+    s_gq_cur = -1;
+    s_gq_next++;
+}
+
+static int gq_cmp(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* After Present: whatever has landed, oldest first, and the window's line
+ * every GQ_WINDOW flips (outside the frames it measures). */
+static void gq_flip(void)
+{
+    unsigned k;
+    for (k = 0; k < GQ_FRAMES; k++) {
+        GqFrame *f = &s_gq[(s_gq_next + k) % GQ_FRAMES];
+        if (f->state == 2)
+            (void)gq_read(f);
+    }
+    if (++s_gqs.flips < GQ_WINDOW)
+        return;
+    if (s_gqs.n) {
+        double sum = 0, p95;
+        int i, c;
+        for (i = 0; i < s_gqs.n; i++)
+            sum += s_gqs.ms[i];
+        qsort(s_gqs.ms, (size_t)s_gqs.n, sizeof s_gqs.ms[0], gq_cmp);
+        p95 = s_gqs.ms[(s_gqs.n * 95) / 100];   /* n >= 1: the index is below n */
+        fprintf(stderr, LOGP "gpu %.3f ms/frame (p95 %.3f) over %d flips: %d frames timed,"
+                " %llu dropped unread, %llu disjoint, %llu category marks capped (flip %llu)\n",
+                sum / s_gqs.n, p95, s_gqs.flips, s_gqs.n, (unsigned long long)s_gqs.dropped,
+                (unsigned long long)s_gqs.disjoint, (unsigned long long)s_gqs.capped,
+                (unsigned long long)s_presents);
+        fprintf(stderr, LOGP "gpu by category (ms/frame):");
+        for (c = 0; c < NV2A_GCAT_N; c++)
+            fprintf(stderr, " %s %.3f", nv2a_gpu_cat_name(c), s_gqs.cat_ms[c] / s_gqs.n);
+        fprintf(stderr, "\n");
+    } else {
+        fprintf(stderr, LOGP "gpu: no frame timed over %d flips (%llu dropped unread,"
+                " %llu disjoint)\n", s_gqs.flips, (unsigned long long)s_gqs.dropped,
+                (unsigned long long)s_gqs.disjoint);
+    }
+    memset(&s_gqs, 0, sizeof s_gqs);
+}
+
 /* ---- render targets: one per guest surface ------------------------------ */
 
 /* A post-process chain can draw more than 8 targets a frame; with 8 the
@@ -1312,6 +1507,8 @@ static void d3d11_on_zclear(uint32_t param)
         dt->earlyz = nv2a_w_earlyz_want();
     if (dt->earlyz)
         z = nv2a_w_earlyz_clear(z, nv2a_zmax(g->format), nv2a_w_earlyz_b());
+    if (gq_on())
+        gq_mark(-1);   /* d3d11_gpu: the frame's GPU work may start here */
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv,
         ((param & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((param & 2u) ? D3D11_CLEAR_STENCIL : 0u),
         z, (UINT8)(v->zclear & 0xFFu));
@@ -1372,6 +1569,8 @@ static void d3d11_on_clear(uint32_t param)
     c[1] = (float)((argb >> 8) & 0xFF) / 255.0f;
     c[2] = (float)(argb & 0xFF) / 255.0f;
     c[3] = (float)(argb >> 24) / 255.0f;
+    if (gq_on())
+        gq_mark(-1);   /* d3d11_gpu: the frame's GPU work may start here */
     clear_region(rt, g, c);
     rt->last_clear = ++s_seq;
     s_clears++;
@@ -3051,6 +3250,8 @@ static RenderTarget *zt_texture(DepthTarget *d, const Stage *t)
             return NULL;
         memcpy(m.pData, zk, sizeof zk);
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_zt_cb, 0);
+        if (gq_on())
+            gq_mark(NV2A_GCAT_ZTEX);   /* d3d11_gpu: the copy and conversion */
         ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)d->zcopy,
                                          (ID3D11Resource *)d->tex);
         ID3D11DeviceContext_CSSetShader(s_ctx, s_zt_cs, NULL, 0);
@@ -4447,6 +4648,27 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
     }
 }
 
+/* d3d11_gpu: the draw about to go into rt, by nv2a_gpu_cat_draw's rule, from
+ * the targets setup_pixel bound (s_stage_rt; the smallest colour one, a
+ * depth view apart). */
+static void gq_draw(const RenderTarget *rt, int depth_test)
+{
+    uint32_t mw = 0, mh = 0;
+    int zt = 0, n;
+    for (n = 0; n < 4; n++) {
+        const RenderTarget *s = s_stage_rt[n];
+        if (!s)
+            continue;
+        if (zt_is_view(s))
+            zt = 1;
+        else if (!mw || s->w * s->h < mw * mh) {
+            mw = s->w;
+            mh = s->h;
+        }
+    }
+    gq_mark(nv2a_gpu_cat_draw(rt->w, rt->h, depth_test, zt, mw, mh));
+}
+
 static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 {
     /* As Metal's: at most three list entries per index, grown to the
@@ -4949,6 +5171,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             mag_draw();
         else if (nv2a_tex_mag_on() && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
             mag_pretransformed(d, v, lo, idx, nidx);
+        if (gq_on())
+            gq_draw(rt, v->depth_enable);   /* d3d11_gpu: this draw's kind */
         if (px_on()) {
             uint32_t before[4];
             int n;
@@ -6748,6 +6972,10 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     /* The frame's target size, for a HUD canvas on "frame". */
     if (s_drawn)
         nv2a_aspect_frame_publish(s_drawn->w, s_drawn->h);
+    /* d3d11_gpu: what follows to Present (the debug drawing, the copy or
+     * scaling blit or shader chain to the back buffer, the overlay) */
+    if (gq_on() && s_drawn)
+        gq_mark(NV2A_GCAT_PRESENT);
 #ifdef XBOXRECOMP_ENHANCE
     dbg_present(s_drawn);
 #endif
@@ -6875,9 +7103,13 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     ovl_present();
     nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
 #endif
+    if (gq_on())
+        gq_end();
     hr = IDXGISwapChain_Present(s_swap, s_sync_interval, s_sync_interval ? 0 : s_present_flags);
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
+    if (gq_on())
+        gq_flip();
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
      * render target anyway. */
     /* The title may read this frame's visibility tests from here on: settle
@@ -7535,6 +7767,8 @@ static void d3d11_on_blit(const struct nv2a_pb_blit *b)
         if (rt->tex && !((rt->addr ^ b->src) & 0x07FFFFFFu) && !rt_drop_if_stale(rt, "blit"))
             src = rt;
     }
+    if (gq_on())
+        gq_mark(NV2A_GCAT_OTHER);   /* d3d11_gpu: a 2D blit's copy */
     if (src && blit_gpu(b, src)) {
         s_blits_gpu++;
         return;

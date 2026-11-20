@@ -1318,6 +1318,31 @@ int nv2a_dof_skip_size(uint32_t w, uint32_t h)
     return 0;
 }
 
+const char *nv2a_gpu_cat_name(int cat)
+{
+    static const char *const name[NV2A_GCAT_N] = {
+        "scene", "blur", "flat", "ztex", "present", "other"
+    };
+    return cat >= 0 && cat < NV2A_GCAT_N ? name[cat] : "?";
+}
+
+/* The rule is the header's. Called by the GPU traces only. */
+int nv2a_gpu_cat_draw(uint32_t rt_w, uint32_t rt_h, int depth_test, int samples_zt,
+                      uint32_t min_rt_w, uint32_t min_rt_h)
+{
+    uint32_t fw = 640, fh = 480;
+    (void)nv2a_aspect_frame(&fw, &fh);
+    if (samples_zt)
+        return NV2A_GCAT_ZTEX;
+    if (rt_w < fw || rt_h < fh)
+        return NV2A_GCAT_BLUR;
+    if (!depth_test)
+        return NV2A_GCAT_FLAT;
+    if (min_rt_w && (min_rt_w < fw || min_rt_h < fh))
+        return NV2A_GCAT_BLUR;
+    return NV2A_GCAT_SCENE;
+}
+
 unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
                            uint32_t other_stage_input)
 {

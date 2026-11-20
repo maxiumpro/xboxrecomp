@@ -327,8 +327,10 @@ static uint64_t prof_now(void)
 
 static int prof_on(void)
 {
+    /* metal_gpu_blocks sets its split beside metal_prof's command-buffer
+     * total, which it needs collected */
     if (s_prof < 0)
-        s_prof = recomp_env(RENV_METAL_PROF) != NULL;
+        s_prof = recomp_env(RENV_METAL_PROF) != NULL || recomp_env(RENV_METAL_GPU_BLOCKS) != NULL;
     return s_prof;
 }
 
@@ -342,6 +344,773 @@ static void prof_add(uint64_t *acc, uint64_t t0)
 {
     if (prof_on())
         *acc += prof_now() - t0;
+}
+
+/* ---- RECOMP_TRACE=metal_passes and metal_gpu_blocks -------------------------
+ *
+ * On a tiler (Apple silicon) a render pass loads its attachments into tile
+ * memory at its start and stores them at its end. A frame cut into more
+ * passes than its targets need, a pass that loads what it then overwrites,
+ * or a store nobody reads, costs GPU time at the passes' edges alone.
+ * Kung Fu Chaos's fight costs the M4 ~8.8 ms of GPU a frame at 1920x1440
+ * where a Vega 8 holds 16.7 ms frames at 2560x1920: about the same by pixel,
+ * so these traces look for what the tiler gives away.
+ *
+ * Each site that ends or opens a pass names why (PT_WHY just before its
+ * end_encoder, flush or begin_pass: those consume it; "untagged" shows a
+ * site this list missed). Each frame's passes are kept (PtFrame) with
+ * their attachments' load and store actions, their draws by kind
+ * (nv2a_gpu_cat_draw) and the first reader of each attachment after them,
+ * and judged one flip later, when the next frame has shown whether it
+ * loads what this one stored or clears it unread. A store whose texture
+ * the next frame never touches is "unknown", not "nobody". Readers are
+ * attachments' textures by identity (the pointer, never used: rt_free can
+ * release one mid-frame); a later texture at a freed one's address can
+ * be taken for it, which this trace accepts.
+ *
+ * metal_gpu_blocks adds each pass's GPU time from timestamps sampled at
+ * its stage boundaries (the only sampling point Apple GPUs offer: no split
+ * between the draws of one pass). A pass is put under its first draw's
+ * kind; a pass whose draws are of several kinds is counted as mixed, with
+ * its draws by kind in the metal_passes_at line, never split. Off, a site
+ * costs the store of its reason and one cached int read. */
+enum {
+    PT_UNTAGGED, PT_TARGET, PT_RESUME, PT_DEPTH, PT_ZCLEAR, PT_CLEAR, PT_CLEAR_Q, PT_ZTEX,
+    PT_SELF_COPY, PT_BLIT, PT_GROW, PT_SYNC, PT_REPORT, PT_QUERY_READ, PT_RING, PT_EVICT,
+    PT_FLIP, PT_DEBUG, PT_HOST_PIXELS, PT_SCALE, PT_NWHY
+};
+static const char *const s_pt_why_name[PT_NWHY] = {
+    "untagged", "target", "resume", "depth-attach", "zclear", "clear", "clear-in-query", "ztex",
+    "self-copy", "blit", "grow", "readback", "report", "query-read", "ring-full", "evict",
+    "flip", "debug-draw", "host-pixels", "scale"
+};
+static int s_pt_why;   /* the reason the next end_encoder or begin_pass runs for */
+#define PT_WHY(r) (s_pt_why = (r))
+
+/* Encoders: begin_pass's, a render encoder made elsewhere (rt_grow's
+ * clear), compute, blit. */
+enum { PTK_RENDER, PTK_AUX, PTK_COMPUTE, PTK_BLIT, PTK_N };
+static const char *const s_ptk_name[PTK_N] = { "render", "render-aux", "compute", "blit" };
+/* An attachment's first reader after the pass that stored it. */
+enum { PTR_NONE, PTR_TEXTURE, PTR_LOAD, PTR_ZTEX, PTR_BLIT, PTR_FLIP, PTR_READBACK,
+       PTR_CLEARED, PTR_UNKNOWN };
+static const char *const s_ptr_name[] = {
+    "nobody yet", "texture", "load", "ztex compute", "blit", "flip", "readback",
+    "overwritten unread (a clear or whole copy)", "unknown (the next frame never touches it)"
+};
+
+#define PT_MAX   256            /* passes kept a frame */
+#define GB_SLOTS (PT_MAX * 4)   /* timestamps a frame: 4 a render pass, 2 a compute or blit */
+#define PT_W_MAX 64             /* attachment planes with a last writer */
+typedef struct {
+    const void *tex;            /* identity only */
+    uint32_t addr, w, h, hw, hh, fmt;
+    uint8_t  on, clear, store;  /* loadAction Clear (else Load); storeAction Store */
+    uint8_t  rkind, rnext;      /* first reader (PTR_*), in the next frame */
+    int16_t  rpass;             /* its pass, -1 none or past the table */
+    uint16_t nread;
+} PtAtt;
+typedef struct {
+    uint8_t  kind, open_why, close_why, cat, mixed, first_seen, first_full;
+    uint8_t  after;             /* opened with no pass open: why the last one closed; 0xFF */
+    uint8_t  reopen;            /* the same colour target loaded right after its pass closed:
+                                 * that close's reason; 0xFF */
+    uint32_t draws, clears;
+    uint32_t cat_draws[NV2A_GCAT_N];
+    PtAtt    att[3];            /* colour, depth, stencil */
+    int      gb;                /* its first timestamp slot, -1 none */
+    uint64_t ticks;             /* GPU timestamp ticks, end - start */
+} PtPass;
+typedef struct {
+    uint64_t flip;
+    int      n, over;           /* passes kept, and passes past PT_MAX */
+    int      nk[PTK_N];         /* encoders made, by kind */
+    int      gb_n;              /* timestamp slots used */
+    PtPass   p[PT_MAX];
+} PtFrame;
+static PtFrame s_ptf[2];        /* by flip parity: this frame and the one being judged */
+static int      s_pt_cur = -1;  /* the open render pass's index */
+static uint64_t s_pt_cur_flip;
+static int      s_pt_aux = -1;  /* the last compute or blit pass's index */
+/* The last render pass closed: its colour texture, frame and reason. */
+static struct { const void *tex; uint64_t flip; int why, valid; } s_pt_last;
+static struct { const void *tex; uint8_t plane; uint64_t flip; int16_t pass; } s_ptw[PT_W_MAX];
+static int s_ptw_n;
+static struct {
+    int      flips;
+    uint64_t nk[PTK_N];
+    int      maxk[PTK_N];
+    uint64_t close[PT_NWHY], reopen[PT_NWHY];
+    uint64_t empty, mixed, over;
+    uint64_t sus_load, sus_store[3], unknown[3];
+    /* metal_gpu_blocks */
+    uint64_t cat_ticks[NV2A_GCAT_N], mixed_ticks, gb_passes, gb_missing;
+    uint64_t cmd_ns;            /* the command buffers' GPU time (prof_flip_end) */
+} s_pts;
+static int  s_pt_on = -1, s_pt_log;
+static long s_pt_at = -1;       /* metal_passes_at */
+static int  s_gb_on = -1;       /* metal_gpu_blocks: sampling */
+static id   s_gb_sb[2];         /* id<MTLCounterSampleBuffer> by flip parity */
+static id   s_gb_cmd[2];        /* the last command buffer sampled into each */
+static uint64_t s_gb_cal_ns, s_gb_cal_gpu;   /* a (host ns, GPU tick) pair */
+
+/* The passes bookkeeping, for either trace. */
+static int pt_on(void)
+{
+    if (s_pt_on < 0) {
+        s_pt_log = recomp_env(RENV_METAL_PASSES) != NULL;
+        s_pt_on = s_pt_log || recomp_env(RENV_METAL_GPU_BLOCKS) != NULL;
+        s_pt_at = s_pt_log ? recomp_env_int(RENV_METAL_PASSES_AT, -1) : -1;
+    }
+    return s_pt_on;
+}
+
+/* Stage-boundary timestamps, made on the first pass after init (s_dev). 0
+ * with a line when the device cannot: metal_passes still counts. */
+static int gb_init(void)
+{
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        id<MTLCounterSet> set = nil;
+        MTLCounterSampleBufferDescriptor *d;
+        NSError *err = nil;
+        MTLTimestamp ct = 0, gt = 0;
+        int i;
+        if (![s_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            fprintf(stderr, LOGP "metal_gpu_blocks: %s samples no counters at stage boundaries:"
+                    " no GPU time by pass\n", [[s_dev name] UTF8String]);
+            return 0;
+        }
+        for (id<MTLCounterSet> cs in [s_dev counterSets])
+            if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp])
+                set = cs;
+        if (!set) {
+            fprintf(stderr, LOGP "metal_gpu_blocks: no timestamp counter set: no GPU time by pass\n");
+            return 0;
+        }
+        d = [[MTLCounterSampleBufferDescriptor alloc] init];
+        d.counterSet = set;
+        d.storageMode = MTLStorageModeShared;
+        d.sampleCount = GB_SLOTS;
+        for (i = 0; i < 2; i++) {
+            s_gb_sb[i] = [s_dev newCounterSampleBufferWithDescriptor:d error:&err];
+            if (!s_gb_sb[i]) {
+                fprintf(stderr, LOGP "metal_gpu_blocks: no counter sample buffer (%s): no GPU"
+                        " time by pass\n", err ? [[err localizedDescription] UTF8String] : "?");
+                [s_gb_sb[0] release];
+                s_gb_sb[0] = nil;
+                [d release];
+                return 0;
+            }
+        }
+        [d release];
+        /* The GPU's ticks are calibrated against prof_now() between two of
+         * these (gb_window): no assumption about the tick's unit. */
+        [s_dev sampleTimestamps:&ct gpuTimestamp:&gt];
+        s_gb_cal_ns = prof_now();
+        s_gb_cal_gpu = gt;
+        fprintf(stderr, LOGP "metal_gpu_blocks: pass timestamps at stage boundaries, up to %d"
+                " passes a frame\n", PT_MAX);
+        return 1;
+    }
+    fprintf(stderr, LOGP "metal_gpu_blocks: needs macOS 11: no GPU time by pass\n");
+    return 0;
+}
+
+static int gb_on(void)
+{
+    if (s_gb_on < 0)
+        s_gb_on = s_dev && recomp_env(RENV_METAL_GPU_BLOCKS) ? gb_init() : 0;
+    return s_gb_on;
+}
+
+static void gb_note_cmd(void)
+{
+    int k = (int)(s_presents & 1);
+    if (s_gb_cmd[k] != s_cmd) {
+        [s_gb_cmd[k] release];
+        s_gb_cmd[k] = [s_cmd retain];
+    }
+}
+
+/* n timestamp slots of this frame's buffer, -1 when they are used up. */
+static int gb_take(int n)
+{
+    PtFrame *f = &s_ptf[s_presents & 1];
+    int base;
+    if (f->gb_n + n > GB_SLOTS)
+        return -1;
+    base = f->gb_n;
+    f->gb_n += n;
+    gb_note_cmd();
+    return base;
+}
+
+static PtFrame *pt_frame(void)
+{
+    return &s_ptf[s_presents & 1];
+}
+
+/* A new pass record in this frame, NULL past PT_MAX (counted). */
+static PtPass *pt_new(int kind, int why, int *idx)
+{
+    PtFrame *f = pt_frame();
+    PtPass *p;
+    f->nk[kind]++;
+    if (f->n >= PT_MAX) {
+        f->over++;
+        *idx = -1;
+        return NULL;
+    }
+    *idx = f->n;
+    p = &f->p[f->n++];
+    memset(p, 0, sizeof *p);
+    p->kind = (uint8_t)kind;
+    p->open_why = (uint8_t)why;
+    p->close_why = PT_UNTAGGED;
+    p->after = p->reopen = 0xFF;
+    p->cat = NV2A_GCAT_OTHER;
+    p->gb = -1;
+    return p;
+}
+
+static int ptw_find(const void *tex, int plane)
+{
+    int i;
+    for (i = 0; i < s_ptw_n; i++)
+        if (s_ptw[i].tex == tex && s_ptw[i].plane == plane)
+            return i;
+    return -1;
+}
+
+/* The attachment record writer entry w names, while its frame is kept: this
+ * one, the last, and at the flip's end the one being judged (s_presents has
+ * moved on by then). */
+static PtAtt *ptw_att(int w)
+{
+    uint64_t fl = s_ptw[w].flip;
+    PtFrame *f = &s_ptf[fl & 1];
+    if (fl > s_presents || fl + 2 < s_presents || f->flip != fl
+            || s_ptw[w].pass < 0 || s_ptw[w].pass >= f->n)
+        return NULL;
+    return &f->p[s_ptw[w].pass].att[s_ptw[w].plane];
+}
+
+/* tex's plane (0 colour, 1 depth, 2 stencil) read by `kind`, in pass `by`
+ * of this frame (-1: not a pass, or past the table). */
+static void pt_read(const void *tex, int plane, int kind, int by)
+{
+    int w = ptw_find(tex, plane);
+    PtAtt *a;
+    if (w < 0 || !(a = ptw_att(w)))
+        return;
+    if (!a->rkind) {
+        a->rkind = (uint8_t)kind;
+        a->rpass = (int16_t)by;
+        a->rnext = s_ptw[w].flip != s_presents;
+    }
+    if (a->nread < 0xFFFF)
+        a->nread++;
+}
+
+/* Pass `by` writes tex's plane, loading it (clear 0) or not (clear 1): a
+ * load reads the last writer's store, a clear before any reader leaves it
+ * unread. */
+static void pt_write(const void *tex, int plane, int clear, int by)
+{
+    int w = ptw_find(tex, plane);
+    if (w >= 0) {
+        PtAtt *a = ptw_att(w);
+        if (a && !a->rkind) {
+            a->rkind = clear ? PTR_CLEARED : PTR_LOAD;
+            a->rpass = (int16_t)by;
+            a->rnext = s_ptw[w].flip != s_presents;
+        }
+        if (a && !clear && a->nread < 0xFFFF)
+            a->nread++;
+    } else {
+        if (s_ptw_n < PT_W_MAX) {
+            w = s_ptw_n++;
+        } else {   /* full: the oldest entry goes */
+            int i;
+            for (w = 0, i = 1; i < s_ptw_n; i++)
+                if (s_ptw[i].flip < s_ptw[w].flip)
+                    w = i;
+        }
+        s_ptw[w].tex = tex;
+        s_ptw[w].plane = (uint8_t)plane;
+    }
+    s_ptw[w].flip = s_presents;
+    s_ptw[w].pass = (int16_t)by;
+}
+
+static void pt_att(PtAtt *a, const void *tex, uint32_t addr, uint32_t w, uint32_t h,
+                   uint32_t hw, uint32_t hh, uint32_t fmt, int clear)
+{
+    a->on = 1;
+    a->tex = tex;
+    a->addr = addr;
+    a->w = w;
+    a->h = h;
+    a->hw = hw;
+    a->hh = hh;
+    a->fmt = fmt;
+    a->clear = (uint8_t)clear;
+    a->store = 1;   /* begin_pass stores every attachment */
+    a->rpass = -1;
+}
+
+/* begin_pass, its descriptor filled: the pass's record, its writes, and
+ * its timestamps (metal_gpu_blocks). `closed_now`: begin_pass itself
+ * closed the pass before it. */
+static void pt_open(const RenderTarget *rt, const DepthTarget *dt, MTLRenderPassDescriptor *rp,
+                    int why, int closed_now)
+{
+    int idx, load = rp.colorAttachments[0].loadAction == MTLLoadActionLoad;
+    int same = s_pt_last.valid && s_pt_last.flip == s_presents && s_pt_last.tex == (const void *)rt->tex;
+    PtPass *p = pt_new(PTK_RENDER, why, &idx);
+    s_pt_cur = idx;
+    s_pt_cur_flip = s_presents;
+    if (load && same)
+        s_pts.reopen[s_pt_last.why]++;
+    if (p) {
+        if (!closed_now && s_pt_last.valid && s_pt_last.flip == s_presents)
+            p->after = (uint8_t)s_pt_last.why;
+        if (load && same)
+            p->reopen = (uint8_t)s_pt_last.why;
+        pt_att(&p->att[0], rt->tex, rt->addr, rt->w, rt->h, rt->hw, rt->hh, rt->fmt, !load);
+        if (dt) {
+            pt_att(&p->att[1], dt->tex, dt->addr, dt->w, dt->h, dt->hw, dt->hh, dt->zfmt,
+                   rp.depthAttachment.loadAction == MTLLoadActionClear);
+            pt_att(&p->att[2], dt->tex, dt->addr, dt->w, dt->h, dt->hw, dt->hh, dt->zfmt,
+                   rp.stencilAttachment.loadAction == MTLLoadActionClear);
+        }
+    }
+    pt_write(rt->tex, 0, !load, idx);
+    if (dt) {
+        pt_write(dt->tex, 1, rp.depthAttachment.loadAction == MTLLoadActionClear, idx);
+        pt_write(dt->tex, 2, rp.stencilAttachment.loadAction == MTLLoadActionClear, idx);
+    }
+    if (p && gb_on()) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            int base = gb_take(4);
+            if (base >= 0) {
+                MTLRenderPassSampleBufferAttachmentDescriptor *a = rp.sampleBufferAttachments[0];
+                a.sampleBuffer = (id<MTLCounterSampleBuffer>)s_gb_sb[s_presents & 1];
+                a.startOfVertexSampleIndex = (NSUInteger)base;
+                a.endOfVertexSampleIndex = (NSUInteger)base + 1;
+                a.startOfFragmentSampleIndex = (NSUInteger)base + 2;
+                a.endOfFragmentSampleIndex = (NSUInteger)base + 3;
+                p->gb = base;
+            }
+        }
+    }
+}
+
+/* end_encoder, a render pass open: its close reason. */
+static void pt_close(void)
+{
+    PtFrame *f = pt_frame();
+    s_pts.close[s_pt_why]++;
+    s_pt_last.valid = 1;
+    s_pt_last.flip = s_presents;
+    s_pt_last.why = s_pt_why;
+    s_pt_last.tex = NULL;
+    if (s_pt_cur >= 0 && s_pt_cur_flip == s_presents && s_pt_cur < f->n) {
+        PtPass *p = &f->p[s_pt_cur];
+        p->close_why = (uint8_t)s_pt_why;
+        s_pt_last.tex = p->att[0].tex;
+    }
+    s_pt_cur = -1;
+}
+
+static PtPass *pt_cur_pass(void)
+{
+    PtFrame *f = pt_frame();
+    if (s_pt_cur < 0 || s_pt_cur_flip != s_presents || s_pt_cur >= f->n)
+        return NULL;
+    return &f->p[s_pt_cur];
+}
+
+/* A draw of kind cat in the open pass; full: the heuristic's "covers the
+ * whole colour target opaquely" (pt_draw). */
+static void pt_note_draw(int cat, int full)
+{
+    PtPass *p = pt_cur_pass();
+    if (!p)
+        return;
+    if (!p->first_seen) {
+        p->first_seen = 1;
+        p->first_full = (uint8_t)full;
+        p->cat = (uint8_t)cat;
+    } else if (cat != p->cat) {
+        p->mixed = 1;
+    }
+    p->draws++;
+    p->cat_draws[cat]++;
+}
+
+/* metal_on_clear's partial clear, a draw under a scissor. */
+static void pt_note_clear(void)
+{
+    PtPass *p = pt_cur_pass();
+    if (!p)
+        return;
+    p->clears++;
+    p->first_seen = 1;
+}
+
+/* A compute or blit pass (or another render encoder) about to be made;
+ * its index (s_pt_aux) for the reads and writes that follow. */
+static int pt_aux(int kind, int why, int cat)
+{
+    int idx;
+    PtPass *p = pt_new(kind, why, &idx);
+    if (p) {
+        p->cat = (uint8_t)cat;
+        p->close_why = (uint8_t)why;
+    }
+    s_pt_aux = idx;
+    return idx;
+}
+
+/* pt_aux's compute encoder, with timestamps under metal_gpu_blocks. */
+static id<MTLComputeCommandEncoder> pt_compute(int why, int cat)
+{
+    int idx = pt_aux(PTK_COMPUTE, why, cat);
+    if (idx >= 0 && gb_on()) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            int base = gb_take(2);
+            if (base >= 0) {
+                MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
+                MTLComputePassSampleBufferAttachmentDescriptor *a = cd.sampleBufferAttachments[0];
+                a.sampleBuffer = (id<MTLCounterSampleBuffer>)s_gb_sb[s_presents & 1];
+                a.startOfEncoderSampleIndex = (NSUInteger)base;
+                a.endOfEncoderSampleIndex = (NSUInteger)base + 1;
+                pt_frame()->p[idx].gb = base;
+                return [s_cmd computeCommandEncoderWithDescriptor:cd];
+            }
+        }
+    }
+    return [s_cmd computeCommandEncoder];
+}
+
+/* pt_aux's blit encoder, with timestamps under metal_gpu_blocks. */
+static id<MTLBlitCommandEncoder> pt_blit(int why, int cat)
+{
+    int idx = pt_aux(PTK_BLIT, why, cat);
+    if (idx >= 0 && gb_on()) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            int base = gb_take(2);
+            if (base >= 0) {
+                MTLBlitPassDescriptor *bd = [MTLBlitPassDescriptor blitPassDescriptor];
+                MTLBlitPassSampleBufferAttachmentDescriptor *a = bd.sampleBufferAttachments[0];
+                a.sampleBuffer = (id<MTLCounterSampleBuffer>)s_gb_sb[s_presents & 1];
+                a.startOfEncoderSampleIndex = (NSUInteger)base;
+                a.endOfEncoderSampleIndex = (NSUInteger)base + 1;
+                pt_frame()->p[idx].gb = base;
+                return [s_cmd blitCommandEncoderWithDescriptor:bd];
+            }
+        }
+    }
+    return [s_cmd blitCommandEncoder];
+}
+
+/* The frame being judged's timestamps into its passes' ticks. Its command
+ * buffers are done (the flip after it waited for later work on the same
+ * queue); the last one sampled into is waited for if not. */
+static void gb_resolve(PtFrame *f)
+{
+    int k = (int)(f->flip & 1), i;
+    if (s_gb_on <= 0 || !f->gb_n)
+        return;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> c = (id<MTLCommandBuffer>)s_gb_cmd[k];
+            NSData *d;
+            const MTLCounterResultTimestamp *ts;
+            if (c && [c status] < MTLCommandBufferStatusCompleted) {
+                if ([c status] < MTLCommandBufferStatusCommitted) {
+                    s_pts.gb_missing += (uint64_t)f->n;   /* never committed: nothing to read */
+                    return;
+                }
+                [c waitUntilCompleted];
+            }
+            d = [(id<MTLCounterSampleBuffer>)s_gb_sb[k] resolveCounterRange:NSMakeRange(0, (NSUInteger)f->gb_n)];
+            if (!d || [d length] < (NSUInteger)f->gb_n * sizeof *ts) {
+                s_pts.gb_missing += (uint64_t)f->n;
+                return;
+            }
+            ts = (const MTLCounterResultTimestamp *)[d bytes];
+            for (i = 0; i < f->n; i++) {
+                PtPass *p = &f->p[i];
+                uint64_t lo = UINT64_MAX, hi = 0;
+                int j, n = p->kind == PTK_RENDER ? 4 : 2;
+                if (p->gb < 0) {
+                    if (p->kind != PTK_AUX)
+                        s_pts.gb_missing++;
+                    continue;
+                }
+                for (j = 0; j < n; j++) {
+                    uint64_t v = ts[p->gb + j].timestamp;
+                    if (v == MTLCounterErrorValue || !v)
+                        continue;   /* a stage the pass never ran */
+                    if (v < lo)
+                        lo = v;
+                    if (v > hi)
+                        hi = v;
+                }
+                if (hi <= lo) {
+                    s_pts.gb_missing++;
+                    continue;
+                }
+                p->ticks = hi - lo;
+                s_pts.cat_ticks[p->cat] += p->ticks;
+                if (p->mixed)
+                    s_pts.mixed_ticks += p->ticks;
+                s_pts.gb_passes++;
+            }
+        }
+    }
+}
+
+/* host ns a GPU tick, over the window since the last call; 0 when the two
+ * samples cannot tell. */
+static double gb_window(void)
+{
+    double r = 0;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        MTLTimestamp ct = 0, gt = 0;
+        uint64_t now;
+        [s_dev sampleTimestamps:&ct gpuTimestamp:&gt];
+        now = prof_now();
+        if (gt > s_gb_cal_gpu && now > s_gb_cal_ns)
+            r = (double)(now - s_gb_cal_ns) / (double)(gt - s_gb_cal_gpu);
+        s_gb_cal_ns = now;
+        s_gb_cal_gpu = gt;
+    }
+    return r;
+}
+
+static const char *pt_cat_draws(const PtPass *p, char *b, size_t n)
+{
+    size_t at = 0;
+    int c;
+    b[0] = 0;
+    for (c = 0; c < NV2A_GCAT_N && at < n; c++)
+        if (p->cat_draws[c])
+            at += (size_t)snprintf(b + at, n - at, "%s%s %u", at ? ", " : "",
+                                   nv2a_gpu_cat_name(c), p->cat_draws[c]);
+    return b;
+}
+
+static void pt_print_att(const char *what, const PtAtt *a, char *b, size_t n)
+{
+    char r[96];
+    if (!a->on) {
+        snprintf(b, n, " | %s none", what);
+        return;
+    }
+    if (a->rkind == PTR_NONE || a->rkind == PTR_UNKNOWN || a->rkind == PTR_FLIP
+            || a->rkind == PTR_READBACK || a->rpass < 0)
+        snprintf(r, sizeof r, "%s", s_ptr_name[a->rkind]);
+    else
+        snprintf(r, sizeof r, "%s by %s#%d", s_ptr_name[a->rkind], a->rnext ? "next frame " : "",
+                 a->rpass);
+    snprintf(b, n, " | %s 0x%08X %ux%u host %ux%u %s fmt 0x%X x1 load=%s store=%s read: %s"
+             " (%u reads)", what, a->addr, a->w, a->h, a->hw, a->hh,
+             what[0] == 'c' ? "BGRA8Unorm" : "Depth32Float_Stencil8", a->fmt,
+             a->clear ? "clear" : "load", a->store ? "store" : "dontcare", r, a->nread);
+}
+
+/* metal_passes_at: the judged frame, a line a pass, then its suspects. */
+static void pt_detail(const PtFrame *f, double nspt)
+{
+    static const char *const plane[3] = { "colour", "depth", "stencil" };
+    char cd[160], at[3][320];
+    int i, k, ns = 0;
+    fprintf(stderr, LOGP "passes flip %llu: %d passes (%d render, %d render-aux, %d compute,"
+            " %d blit), %d past the table\n", (unsigned long long)f->flip, f->n + f->over,
+            f->nk[PTK_RENDER], f->nk[PTK_AUX], f->nk[PTK_COMPUTE], f->nk[PTK_BLIT], f->over);
+    for (i = 0; i < f->n; i++) {
+        const PtPass *p = &f->p[i];
+        char gpu[48] = "";
+        if (p->ticks && nspt > 0)
+            snprintf(gpu, sizeof gpu, " gpu %.3f ms", p->ticks * nspt / 1e6);
+        else if (p->ticks)
+            snprintf(gpu, sizeof gpu, " gpu %llu ticks", (unsigned long long)p->ticks);
+        for (k = 0; k < 3; k++)
+            pt_print_att(plane[k], &p->att[k], at[k], sizeof at[k]);
+        fprintf(stderr, LOGP "pass %llu #%d %s open=%s%s%s close=%s draws %u (%s) clears %u"
+                " kind %s%s%s%s%s%s\n", (unsigned long long)f->flip, i, s_ptk_name[p->kind],
+                s_pt_why_name[p->open_why], p->after != 0xFF ? " after " : "",
+                p->after != 0xFF ? s_pt_why_name[p->after] : "", s_pt_why_name[p->close_why],
+                p->draws, pt_cat_draws(p, cd, sizeof cd), p->clears, nv2a_gpu_cat_name(p->cat),
+                p->mixed ? " (mixed)" : "", gpu,
+                p->kind == PTK_RENDER ? at[0] : "", p->kind == PTK_RENDER ? at[1] : "",
+                p->kind == PTK_RENDER ? at[2] : "");
+    }
+    for (i = 0; i < f->n; i++) {
+        const PtPass *p = &f->p[i];
+        if (p->kind != PTK_RENDER)
+            continue;
+        if (p->reopen != 0xFF) {
+            fprintf(stderr, LOGP "suspect %llu #%d: its colour target loaded again right after"
+                    " the last render pass on it closed for %s (a store and a load of the same"
+                    " target)\n", (unsigned long long)f->flip, i, s_pt_why_name[p->reopen]);
+            ns++;
+        }
+        if (!p->draws && !p->clears) {
+            fprintf(stderr, LOGP "suspect %llu #%d: no draw (only its load actions ran)\n",
+                    (unsigned long long)f->flip, i);
+            ns++;
+        }
+        if (!p->att[0].clear && p->first_full) {
+            fprintf(stderr, LOGP "suspect %llu #%d: colour load=load, its first draw an opaque"
+                    " quad over the whole scissored target (heuristic)\n",
+                    (unsigned long long)f->flip, i);
+            ns++;
+        }
+        for (k = 0; k < 3; k++) {
+            const PtAtt *a = &p->att[k];
+            if (!a->on || !a->store)
+                continue;
+            if (a->rkind == PTR_CLEARED) {
+                fprintf(stderr, LOGP "suspect %llu #%d: %s store=store, overwritten unread by"
+                        " %s#%d\n",
+                        (unsigned long long)f->flip, i, plane[k], a->rnext ? "next frame " : "",
+                        a->rpass);
+                ns++;
+            } else if (a->rkind == PTR_UNKNOWN) {
+                fprintf(stderr, LOGP "suspect? %llu #%d: %s store=store, %s\n",
+                        (unsigned long long)f->flip, i, plane[k], s_ptr_name[a->rkind]);
+                ns++;
+            }
+        }
+    }
+    fprintf(stderr, LOGP "passes flip %llu: %d suspects\n", (unsigned long long)f->flip, ns);
+}
+
+/* The judged frame into the window's sums; the window's lines every 300. */
+static void pt_judge(PtFrame *f)
+{
+    int i, k;
+    double nspt = 0;
+    /* What the next frame never touched stays unknown. */
+    for (i = 0; i < s_ptw_n; i++) {
+        if (s_ptw[i].flip != f->flip)
+            continue;
+        {
+            PtAtt *a = ptw_att(i);
+            if (a && !a->rkind)
+                a->rkind = PTR_UNKNOWN;
+        }
+        s_ptw[i--] = s_ptw[--s_ptw_n];
+    }
+    gb_resolve(f);
+    for (k = 0; k < PTK_N; k++) {
+        s_pts.nk[k] += (uint64_t)f->nk[k];
+        if (f->nk[k] > s_pts.maxk[k])
+            s_pts.maxk[k] = f->nk[k];
+    }
+    s_pts.over += (uint64_t)f->over;
+    for (i = 0; i < f->n; i++) {
+        const PtPass *p = &f->p[i];
+        if (p->kind != PTK_RENDER)
+            continue;
+        if (!p->draws && !p->clears)
+            s_pts.empty++;
+        if (p->mixed)
+            s_pts.mixed++;
+        if (!p->att[0].clear && p->first_full)
+            s_pts.sus_load++;
+        for (k = 0; k < 3; k++) {
+            if (!p->att[k].on || !p->att[k].store)
+                continue;
+            if (p->att[k].rkind == PTR_CLEARED)
+                s_pts.sus_store[k]++;
+            else if (p->att[k].rkind == PTR_UNKNOWN)
+                s_pts.unknown[k]++;
+        }
+    }
+    if (s_pt_log && s_pt_at >= 0 && f->flip == (uint64_t)s_pt_at) {
+        /* restarts the calibration window: the next line's is shorter */
+        nspt = s_gb_on > 0 ? gb_window() : 0;
+        pt_detail(f, nspt);
+    }
+    if (++s_pts.flips < 300)
+        return;
+    {
+        double n = (double)s_pts.flips;
+        char line[1024];
+        size_t at = 0;
+        if (s_pt_log) {
+            fprintf(stderr, LOGP "passes over %d flips: render %.2f/frame (max %d), render-aux"
+                    " %.2f (max %d), compute %.2f (max %d), blit %.2f (max %d); %.2f render"
+                    " passes/frame with no draw, %.2f of several kinds; %llu passes past the table\n",
+                    s_pts.flips, s_pts.nk[PTK_RENDER] / n, s_pts.maxk[PTK_RENDER],
+                    s_pts.nk[PTK_AUX] / n, s_pts.maxk[PTK_AUX], s_pts.nk[PTK_COMPUTE] / n,
+                    s_pts.maxk[PTK_COMPUTE], s_pts.nk[PTK_BLIT] / n, s_pts.maxk[PTK_BLIT],
+                    s_pts.empty / n, s_pts.mixed / n, (unsigned long long)s_pts.over);
+            at = 0;
+            line[0] = 0;
+            for (k = 0; k < PT_NWHY && at < sizeof line; k++)
+                if (s_pts.close[k])
+                    at += (size_t)snprintf(line + at, sizeof line - at, " %s %.2f",
+                                           s_pt_why_name[k], s_pts.close[k] / n);
+            fprintf(stderr, LOGP "passes closed by (/frame):%s\n", line);
+            at = 0;
+            line[0] = 0;
+            for (k = 0; k < PT_NWHY && at < sizeof line; k++)
+                if (s_pts.reopen[k])
+                    at += (size_t)snprintf(line + at, sizeof line - at, " %s %.2f",
+                                           s_pt_why_name[k], s_pts.reopen[k] / n);
+            fprintf(stderr, LOGP "same colour target reopened with Load after (/frame):%s\n",
+                    at ? line : " none");
+            fprintf(stderr, LOGP "suspects (/frame): load over an opaque whole-target first draw"
+                    " %.2f (heuristic); stored and cleared unread: colour %.2f depth %.2f stencil"
+                    " %.2f; stored, untouched by the next frame (unknown): colour %.2f depth %.2f"
+                    " stencil %.2f\n", s_pts.sus_load / n, s_pts.sus_store[0] / n,
+                    s_pts.sus_store[1] / n, s_pts.sus_store[2] / n, s_pts.unknown[0] / n,
+                    s_pts.unknown[1] / n, s_pts.unknown[2] / n);
+        }
+        if (s_gb_on > 0) {
+            double r = gb_window(), sum = 0, scale = r > 0 ? r : 1.0;
+            at = 0;
+            line[0] = 0;
+            for (k = 0; k < NV2A_GCAT_N; k++) {
+                double ms = s_pts.cat_ticks[k] * scale / n / 1e6;
+                sum += ms;
+                at += (size_t)snprintf(line + at, sizeof line - at, "%s%s %.3f", k ? " + " : "",
+                                       nv2a_gpu_cat_name(k), ms);
+            }
+            fprintf(stderr, LOGP "gpu blocks over %d flips (ms/frame): %s = %.3f by pass (mixed"
+                    " passes %.3f of it); command buffers %.3f, passes - buffers %+.3f (a tiler"
+                    " overlaps one pass's vertex work with another's fragments; render-aux"
+                    " encoders are not timed); %s %.3f ns/tick; %llu passes timed, %llu without"
+                    " timestamps\n", s_pts.flips, line, sum,
+                    s_pts.mixed_ticks * scale / n / 1e6, s_pts.cmd_ns / n / 1e6,
+                    sum - s_pts.cmd_ns / n / 1e6, r > 0 ? "calibrated" : "UNCALIBRATED, taken as",
+                    scale, (unsigned long long)s_pts.gb_passes,
+                    (unsigned long long)s_pts.gb_missing);
+        }
+        memset(&s_pts, 0, sizeof s_pts);
+    }
+}
+
+/* prof_flip_end, after s_presents moved to the next frame: the frame
+ * before the one just shown is judged (this one has shown its loads and
+ * clears), and its table starts the next frame. */
+static void pt_flip(void)
+{
+    PtFrame *f = &s_ptf[s_presents & 1];
+    if (s_presents >= 2 && f->flip == s_presents - 2)
+        pt_judge(f);
+    f->flip = s_presents;
+    f->n = f->over = f->gb_n = 0;
+    memset(f->nk, 0, sizeof f->nk);
+    s_pt_cur = -1;
+    s_pt_aux = -1;
+    s_pt_last.valid = 0;
 }
 
 /* metal_shaders: what the first use of a shader, pipeline or texture costs
@@ -375,11 +1144,14 @@ static uint64_t s_c_uploads;   /* c[] writes to buffer 1; "consts" in the flip t
 static void end_encoder(void)
 {
     if (s_enc) {
+        if (pt_on())
+            pt_close();   /* metal_passes: why it closes (s_pt_why) */
         occ_pass_end();
         [s_enc endEncoding];
         [s_enc release];
         s_enc = nil;
     }
+    s_pt_why = PT_UNTAGGED;   /* consumed, whether a pass was open or not */
     s_enc_rt = NULL;
     s_enc_dt = NULL;
 }
@@ -435,6 +1207,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
 {
     MTLRenderPassDescriptor *rp;
     DepthTarget *dt = rt->dt;
+    int why = s_pt_why, had = s_enc != nil;   /* metal_passes: end_encoder consumes it */
     end_encoder();
     ensure_cmd();
     rt->dirty = 1;
@@ -466,6 +1239,8 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
         dt->fresh = 0;
     }
     rp.visibilityResultBuffer = s_vis;
+    if (pt_on())
+        pt_open(rt, dt, rp, why, had);   /* metal_passes, and the timestamps of metal_gpu_blocks */
     s_enc = [[s_cmd renderCommandEncoderWithDescriptor:rp] retain];
     s_enc_serial++;
     s_enc_rt = rt;
@@ -635,8 +1410,10 @@ static void rt_free(RenderTarget *rt)
         return;
     if (rt->dirty && rt->presented)
         rt_sync(rt, rt->pitch);
-    if (s_enc_rt == rt)
+    if (s_enc_rt == rt) {
+        PT_WHY(PT_EVICT);
         end_encoder();
+    }
     [rt->tex release];
     memset(rt, 0, sizeof *rt);
 }
@@ -691,8 +1468,10 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     }
     if (!e) {
         e = lru;
-        if (s_enc_dt == e)
+        if (s_enc_dt == e) {
+            PT_WHY(PT_EVICT);
             end_encoder();
+        }
         for (i = 0; i < RT_MAX; i++)
             if (s_rt[i].dt == e)
                 s_rt[i].dt = NULL;
@@ -813,6 +1592,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
         rt_sync(rt, rt->pitch);
     /* An encoder must not outlive its attachment's swap, and the passes
      * below need none open. */
+    PT_WHY(PT_GROW);
     end_encoder();
     tex = rt_texture_new(hw, hh);
     if (!tex)
@@ -827,13 +1607,15 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         ensure_cmd();
+        if (pt_on())
+            (void)pt_aux(PTK_AUX, PT_GROW, NV2A_GCAT_OTHER);   /* metal_passes: counted, not timed */
         e = [s_cmd renderCommandEncoderWithDescriptor:rp];
         [e endEncoding];
     }
     if (keep) {
         id<MTLBlitCommandEncoder> b;
         ensure_cmd();
-        b = [s_cmd blitCommandEncoder];
+        b = pt_on() ? pt_blit(PT_GROW, NV2A_GCAT_OTHER) : [s_cmd blitCommandEncoder];
         [b copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0
               sourceOrigin:MTLOriginMake(0, 0, 0)
                 sourceSize:MTLSizeMake(rt->hw, rt->hh, 1)
@@ -1044,13 +1826,17 @@ static void metal_on_clear(uint32_t param)
         c[3] = (double)(argb >> 24) / 255.0;
         s_clears++;
         if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
+            PT_WHY(PT_CLEAR);
             begin_encoder(rt, 1, c);
             return;
         }
-        if (!s_enc || s_enc_rt != rt)
+        if (!s_enc || s_enc_rt != rt) {
+            PT_WHY(s_enc ? PT_TARGET : PT_RESUME);
             begin_encoder(rt, 0, NULL);
+        }
         pso = clear_pso(s_enc_dt ? 1 : 0);
         if (!pso) {
+            PT_WHY(PT_CLEAR);
             begin_encoder(rt, 1, c);
             return;
         }
@@ -1082,9 +1868,13 @@ static void metal_on_clear(uint32_t param)
                 [s_enc setVisibilityResultMode:MTLVisibilityResultModeDisabled
                                         offset:(NSUInteger)s_occ_slot * 8u];
             [s_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            if (pt_on())
+                pt_note_clear();
             /* The scissor stays: each draw sets its own (metal_on_draw). */
-            if (s_occ_slot >= 0)
+            if (s_occ_slot >= 0) {
+                PT_WHY(PT_CLEAR_Q);
                 end_encoder();
+            }
         }
         rt->zseq = ++s_zseq;   /* zt_find */
         s_partial_clears++;
@@ -1121,6 +1911,7 @@ static void metal_on_zclear(uint32_t param)
         s_prof_ez = dt->earlyz;   /* metal_prof: the mode this frame draws in */
         if (dt->earlyz)
             z = nv2a_w_earlyz_clear(z, nv2a_zmax(g->format), nv2a_w_earlyz_b());
+        PT_WHY(PT_ZCLEAR);
         begin_pass(rt, 0, NULL, param & 3u, z, v->zclear & 0xFFu);
         if (param & 1u)
             s_zclears++;
@@ -1161,6 +1952,7 @@ static void *ring_alloc(id<MTLBuffer> b, NSUInteger size, NSUInteger *pos,
     if (bytes > size)
         return NULL;
     if (at + bytes > size) {
+        PT_WHY(PT_RING);
         flush(1);   /* resets both rings */
         at = 0;
     }
@@ -3089,9 +3881,19 @@ static RenderTarget *zt_texture(DepthTarget *d, const Stage *t)
         id<MTLComputeCommandEncoder> c;
         float zmax = nv2a_zmax(d->zfmt << 4), b = nv2a_w_earlyz_b();
         float zk[4] = { d->earlyz ? 1.0f : 0.0f, b, b / zmax, 1.0f / zmax };
+        PT_WHY(PT_ZTEX);
         end_encoder();
         ensure_cmd();
-        c = [s_cmd computeCommandEncoder];
+        if (pt_on()) {
+            /* metal_passes: the depth and stencil stores' reader */
+            c = pt_compute(PT_ZTEX, NV2A_GCAT_ZTEX);
+            if (s_pt_log) {
+                pt_read(d->tex, 1, PTR_ZTEX, s_pt_aux);
+                pt_read(d->tex, 2, PTR_ZTEX, s_pt_aux);
+            }
+        } else {
+            c = [s_cmd computeCommandEncoder];
+        }
         [c setComputePipelineState:s_zt_pso];
         [c setTexture:d->tex atIndex:0];
         [c setTexture:d->zst atIndex:1];
@@ -3187,9 +3989,16 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
     }
     {
         id<MTLBlitCommandEncoder> b;
+        PT_WHY(PT_SELF_COPY);
         end_encoder();
         ensure_cmd();
-        b = [s_cmd blitCommandEncoder];
+        if (pt_on()) {
+            b = pt_blit(PT_SELF_COPY, NV2A_GCAT_OTHER);
+            if (s_pt_log)
+                pt_read(self->tex, 0, PTR_BLIT, s_pt_aux);
+        } else {
+            b = [s_cmd blitCommandEncoder];
+        }
         [b copyFromTexture:self->tex toTexture:s_self.tex];
         [b endEncoding];
     }
@@ -3331,6 +4140,39 @@ static void aspect_log_post(uint32_t hash, const RenderTarget *rt, int place)
     fprintf(stderr, "[aspect.post] %08X flip %llu: picture beside a padded target on %ux%u"
             " pad %u at 0x%08X -> %s\n", hash, (unsigned long long)s_presents, rt->w, rt->h,
             rt->pad, rt->addr, names[place]);
+}
+
+/* metal_passes, metal_gpu_blocks: the draw about to go into the open pass,
+ * by nv2a_gpu_cat_draw's rule from what it samples (the smallest colour
+ * target; a depth view is ZTEX), and the targets it samples as readers of
+ * the passes that stored them (a depth view's reader is its conversion,
+ * the self copy's its blit). The load heuristic's "the first draw covers
+ * the whole colour target": no blend, every channel written, at most two
+ * triangles, the surface clip the whole target. */
+static void pt_draw(const RenderTarget *rt, const RenderTarget *const srcs[4], int depth_test,
+                    uint32_t nidx)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    uint32_t mw = 0, mh = 0, b[4];
+    int zt = 0, k, full;
+    for (k = 0; k < 4; k++) {
+        const RenderTarget *s = srcs[k];
+        if (!s)
+            continue;
+        if (s >= s_zt_view && s < s_zt_view + DT_MAX) {
+            zt = 1;
+            continue;
+        }
+        if (s != &s_self && s_pt_log)
+            pt_read(s->tex, 0, PTR_TEXTURE, s_pt_cur);
+        if (!mw || s->w * s->h < mw * mh) {
+            mw = s->w;
+            mh = s->h;
+        }
+    }
+    full = !g->blend_enable && g->color_keep == 0 && nidx <= 6
+        && nv2a_draw_box(g, rt->w, rt->h, b) && !b[0] && !b[1] && b[2] == rt->w && b[3] == rt->h;
+    pt_note_draw(nv2a_gpu_cat_draw(rt->w, rt->h, depth_test, zt, mw, mh), full);
 }
 
 static void metal_on_draw(const struct nv2a_pb_draw *d)
@@ -3566,8 +4408,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             DepthTarget *dt = depth_target(rt->w, rt->h);
             if (dt && rt->dt != dt) {
                 rt->dt = dt;
-                if (s_enc_rt == rt)
+                if (s_enc_rt == rt) {
+                    PT_WHY(PT_DEPTH);
                     end_encoder();
+                }
             }
             /* A plain-z depth batch on a buffer in RECOMP_W_EARLYZ's mode
              * has no fix this frame: the mode goes off from the next depth
@@ -3752,8 +4596,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             vc.c[11] = b / nv2a_zmax(g->format);
         }
 
-        if (!s_enc || s_enc_rt != rt)
+        if (!s_enc || s_enc_rt != rt) {
+            PT_WHY(s_enc ? PT_TARGET : PT_RESUME);
             begin_encoder(rt, 0, NULL);
+        }
         pso = pipeline(vfn, ffn);
         if (!pso) {
             s_draws_skipped++;
@@ -3896,6 +4742,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             mag_draw();
         else if (nv2a_tex_mag_on() && !d->program && topo == NV2A_TOPO_TRIANGLES)
             mag_pretransformed(vf, nf4, slot, idx, nidx);
+        if (pt_on())
+            pt_draw(rt, srcs, v->depth_enable && s_enc_dt, nidx);   /* metal_passes */
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         /* After the draw: a later batch sampling this depth converts again,
@@ -4108,9 +4956,9 @@ static void rt_managed_sync(RenderTarget *rt)
 
     if (s_unified)
         return;
-    end_encoder();
+    end_encoder();   /* for the caller's reason (metal_passes): readback, flip, host-pixels */
     ensure_cmd();
-    b = [s_cmd blitCommandEncoder];
+    b = pt_on() ? pt_blit(PT_SYNC, NV2A_GCAT_OTHER) : [s_cmd blitCommandEncoder];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     [b synchronizeResource:rt->tex];
@@ -4127,7 +4975,11 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
         return;
     guard_open();
     @autoreleasepool {
+        if (pt_on() && s_pt_log)
+            pt_read(rt->tex, 0, PTR_READBACK, -1);   /* metal_passes */
+        PT_WHY(PT_SYNC);
         rt_managed_sync(rt);
+        PT_WHY(PT_SYNC);
         if (s_cmd)
             flush(1);
         else if (s_last_cmd && [s_last_cmd status] < MTLCommandBufferStatusCompleted)
@@ -4237,7 +5089,9 @@ const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (rt->tex && rt->offset == offset) {
+            PT_WHY(PT_HOST_PIXELS);
             rt_managed_sync(rt);
+            PT_WHY(PT_HOST_PIXELS);
             if (s_cmd)
                 flush(1);
             *hw = rt->hw;
@@ -4554,6 +5408,7 @@ static int occ_result(void *ctx, void *qv, int flush_gpu, uint64_t *count)
         if (q->cmd[i] == s_cmd) {       /* not committed yet */
             if (!flush_gpu)
                 return 0;
+            PT_WHY(PT_QUERY_READ);
             flush(0);
         }
         if (!cmd_done(q->cmd[i]))
@@ -4639,6 +5494,7 @@ static int metal_on_report(uint32_t va)
          * drew in a buffer already committed, gains nothing from it. */
         if (occ_mode() == 0 && s_cmd && report_in_cmd(va)) {
             s_report_commits++;
+            PT_WHY(PT_REPORT);
             flush(0);
         }
     }
@@ -4763,8 +5619,11 @@ static void prof_flip_end(uint64_t t_flip0)
     static uint64_t p_wb, p_ds, p_pa;
     int i;
     uint64_t g0;
-    if (!prof_on())
+    if (!prof_on()) {
+        if (pt_on())
+            pt_flip();   /* metal_passes without metal_prof */
         return;
+    }
     g0 = s_pa.gpu;
     for (i = 0; i < s_prof_ncmd; i++) {
         id<MTLCommandBuffer> c = s_prof_cmd[i];
@@ -4777,6 +5636,10 @@ static void prof_flip_end(uint64_t t_flip0)
     }
     s_pa_ez_gpu[s_prof_ez ? 1 : 0] += s_pa.gpu - g0;
     s_pa_ez_n[s_prof_ez ? 1 : 0]++;
+    if (pt_on()) {
+        s_pts.cmd_ns += s_pa.gpu - g0;   /* metal_gpu_blocks' total to compare */
+        pt_flip();
+    }
     s_pa.ncmd += (uint64_t)s_prof_ncmd;
     s_prof_ncmd = 0;
     s_pa.flip += prof_now() - t_flip0;
@@ -4973,6 +5836,7 @@ static void dbg_present(RenderTarget *rt)
         if (l->n[s])
             memcpy((uint8_t *)[s_dbg_vb contents] + (size_t)first[s] * stride, l->v[s],
                    (size_t)l->n[s] * stride);
+    PT_WHY(PT_DEBUG);
     begin_pass(rt, 0, NULL, 0, 1.0f, 0);
     if (!s_enc)
         return;
@@ -4997,6 +5861,7 @@ static void dbg_present(RenderTarget *rt)
                   vertexStart:first[s]
                   vertexCount:l->n[s]];
     }
+    PT_WHY(PT_DEBUG);
     end_encoder();
 }
 #endif /* XBOXRECOMP_ENHANCE */
@@ -5024,6 +5889,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 hch = ch * rt->n;
                 s_shown_w = cw;
                 s_shown_h = ch;
+                if (pt_on() && s_pt_log)
+                    pt_read(rt->tex, 0, PTR_FLIP, -1);   /* metal_passes */
 #ifdef XBOXRECOMP_ENHANCE
                 dbg_present(rt);
 #endif
@@ -5034,9 +5901,11 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             layer = win && s_layer;
             wb = rt && addr && pitch && pitch >= rt->w * 2u && always;
             hdump = rt && host_dump_due();
+            PT_WHY(PT_FLIP);
             if (rt && (wb || hdump || (win && !layer)))
                 rt_managed_sync(rt);
             t = prof_t();
+            PT_WHY(PT_FLIP);
             flush(1);
             occ_settle(1);
             prof_add(&s_pa.wait, t);
@@ -5054,7 +5923,10 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 if (slot) {
                     id<MTLBlitCommandEncoder> b;
                     ensure_cmd();
-                    b = [s_cmd blitCommandEncoder];
+                    /* metal_gpu_blocks: the present, as far as this backend's
+                     * command buffers see it (the presenter's own pass is
+                     * fb_present_metal.m's) */
+                    b = pt_on() ? pt_blit(PT_FLIP, NV2A_GCAT_PRESENT) : [s_cmd blitCommandEncoder];
                     [b copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0
                           sourceOrigin:MTLOriginMake(0, 0, 0)
                             sourceSize:MTLSizeMake(hcw, hch, 1)
@@ -5219,8 +6091,10 @@ static void scale_drop(void)
             DepthTarget *d = &s_dt[i];
             if (!d->tex)
                 continue;
-            if (s_enc_dt == d)
+            if (s_enc_dt == d) {
+                PT_WHY(PT_SCALE);
                 end_encoder();
+            }
             dt_free(d);
         }
     }
@@ -5357,9 +6231,20 @@ static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
                 " blit copy of 0x%08X\n", dst->offset, dst->w, dst->h, dst->hw, dst->hh,
                 src->offset);
     }
+    PT_WHY(PT_BLIT);
     end_encoder();
     ensure_cmd();
-    e = [s_cmd blitCommandEncoder];
+    if (pt_on()) {
+        /* metal_passes: the source's store read, the copy a write of the
+         * destination (a partial one keeps the rest: a load) */
+        e = pt_blit(PT_BLIT, NV2A_GCAT_OTHER);
+        if (s_pt_log) {
+            pt_read(src->tex, 0, PTR_BLIT, s_pt_aux);
+            pt_write(dst->tex, 0, whole, s_pt_aux);
+        }
+    } else {
+        e = [s_cmd blitCommandEncoder];
+    }
     [e copyFromTexture:src->tex sourceSlice:0 sourceLevel:0
           sourceOrigin:MTLOriginMake(box[0], box[1], 0)
             sourceSize:MTLSizeMake(box[4], box[5], 1)

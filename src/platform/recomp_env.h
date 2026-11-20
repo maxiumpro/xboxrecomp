@@ -171,6 +171,8 @@ extern "C" {
     X(PRESENT_TRACE,     TRACE, "present",         "RECOMP_PRESENT_TRACE",     "present-surface choices") \
     X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
+    X(METAL_PASSES,      TRACE, "metal_passes",    NULL,                       "Metal passes every 300 flips: render, compute and blit encoders a frame (mean, max), each render pass break by reason, passes with no draw, a target reopened with Load by why its last pass closed, and the frames' suspect loads and stores; metal_passes_at=<flip> prints one frame pass by pass") \
+    X(METAL_GPU_BLOCKS,  TRACE, "metal_gpu_blocks", NULL,                      "Metal GPU time a frame by pass category (scene, blur and small copies, flat full-screen, depth as texture, present, other) from stage-boundary timestamps, every 300 flips, beside the command buffers' total (turns metal_prof on)") \
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip; each new pitch-alias pair once") \
     X(METAL_SHADERS,     TRACE, "metal_shaders",   NULL,                       "Metal shader and pipeline builds: each MSL library and pipeline state with its ms, and a [metal] build line for every flip that built one or uploaded textures for 5 ms or more") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
@@ -219,6 +221,7 @@ extern "C" {
     X(FIND_NAN,          TRACE, "find_nan",        "RECOMP_FIND_NAN",          "scan for NaN matrices at reports") \
     X(FIND_QUAD,         TRACE, "find_quad",       "RECOMP_FIND_QUAD",         "scan for quad vertices once") \
     X(D3D11_VERBOSE,     TRACE, "d3d11_verbose",   "RECOMP_D3D11_VERBOSE",     "D3D11 shader sources") \
+    X(D3D11_GPU,         TRACE, "d3d11_gpu",       NULL,                       "D3D11 GPU time a frame from timestamp queries (the frame's first clear, draw or blit to just before Present: a span of the GPU's timeline, gaps included), read a few frames late; mean and p95 every 300 flips, and the span split by pass category") \
     X(D3D11_PX,          TRACE, "px",              "RECOMP_D3D11_PX",          "=x,y[;x,y]: D3D11/CPU draws touching a pixel") \
     X(D3D11_PX_FLIPS,    TRACE, "px_flips",        "RECOMP_D3D11_PX_FLIPS",    "=a[-b]: px only in those flips") \
     X(D3D11_PX_MAX,      TRACE, "px_max",          "RECOMP_D3D11_PX_MAX",      "=n: px line limit (400)") \
@@ -277,6 +280,7 @@ extern "C" {
     X(D3D11_OCC,         DEBUG, "d3d11_occ",       "RECOMP_D3D11_OCC",         "=sync|fixed: D3D11 occlusion mode") \
     X(METAL_NO_MIPS,     DEBUG, "metal_no_mips",   "RECOMP_METAL_NO_MIPS",     "Metal uploads level 0 only") \
     X(METAL_MEMO,        DEBUG, "metal_memo",      NULL,                       "=0: no Metal per-batch memo (c[] by generation, texture stages)") \
+    X(METAL_PASSES_AT,   DEBUG, "metal_passes_at", NULL,                       "=flip: with RECOMP_TRACE=metal_passes, that frame's passes one per line (reasons, draws, attachments with load and store, who reads each later) and its suspects, printed at the end of the next flip") \
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \

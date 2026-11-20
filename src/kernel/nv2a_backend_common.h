@@ -1811,6 +1811,33 @@ unsigned nv2a_host_scale_for(uint32_t w, uint32_t h);
  * test on, depth writes off). Read once. */
 int nv2a_dof_skip_size(uint32_t w, uint32_t h);
 
+/* GPU time by kind of work, for the backends' GPU traces (RECOMP_TRACE=
+ * d3d11_gpu, metal_gpu_blocks). Kung Fu Chaos's frame is a 3D scene in its
+ * 640x480 target, copies to 320x240 and 64x64 blurred there and back, those
+ * copies repainted over the screen with the depth test on (depth of field),
+ * full-screen passes without depth (tint), the depth read as a texture
+ * (fog), and the present; the question is which of them the GPU time goes
+ * to. A draw's kind (nv2a_gpu_cat_draw), the frame being the size of the
+ * target last presented (nv2a_aspect_frame; 640x480 before the first):
+ *   ZTEX  it samples a depth surface as a texture;
+ *   BLUR  its target is smaller than the frame in either dimension, or it
+ *         is frame-sized, depth-tested and samples a render target smaller
+ *         than the frame (the depth-of-field repaint);
+ *   SCENE frame-sized (or larger), depth-tested;
+ *   FLAT  frame-sized (or larger), no depth test (tint, brightness, HUD).
+ * PRESENT is the backend's work at the flip, OTHER whatever a site does
+ * outside a draw (2D blits, copies, a pass with no draw). */
+enum nv2a_gpu_cat {
+    NV2A_GCAT_SCENE, NV2A_GCAT_BLUR, NV2A_GCAT_FLAT, NV2A_GCAT_ZTEX,
+    NV2A_GCAT_PRESENT, NV2A_GCAT_OTHER, NV2A_GCAT_N
+};
+/* "scene", "blur", "flat", "ztex", "present", "other" */
+const char *nv2a_gpu_cat_name(int cat);
+/* min_rt_w/h: the smallest render target (not a depth view) the draw
+ * samples, 0 for none. */
+int nv2a_gpu_cat_draw(uint32_t rt_w, uint32_t rt_h, int depth_test, int samples_zt,
+                      uint32_t min_rt_w, uint32_t min_rt_h);
+
 /* The stages of a draw that a later stage reads as its input
  * (OTHER_STAGE_INPUT): BUMPENVMAP(_LUMINANCE)'s offsets, the dot-product
  * family's normal and DEPENDENT_AR/GB's coordinates (every mode from 8 on),
