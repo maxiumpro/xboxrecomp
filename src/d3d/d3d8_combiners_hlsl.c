@@ -350,7 +350,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                  * the sample calls it, so a render-target or 3D stage pays
                  * no ddx/ddy */
                 if (state->rect_snap == 2)
-                    EMIT("        if (tex_scale[%d].z != 0.0)"
+                    EMIT("        [branch] if (tex_scale[%d].z != 0.0)"
                          " uv = nv2a_snap_uv(uv, i.pos.xy, tex_scale[%d]);\n", i, i);
                 else if (state->rect_snap)
                     EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, tex_scale[%d]);\n", i);
