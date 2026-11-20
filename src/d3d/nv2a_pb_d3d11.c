@@ -3865,15 +3865,18 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
          * RECOMP_DEBUG=d3d11_rect_snap0=1: timing probe, no nv2a_snap_uv at
          * any scale (misplaces 2D texels), Metal's metal_rect_snap0 here. */
         static int no_snap = -1;
-        /* RECOMP_DEBUG=d3d11_snap_lazy=1|alt: Metal's metal_snap_lazy, the
-         * call only where tex_scale.z != 0; alt: even flips only */
+        /* RECOMP_DEBUG=d3d11_snap_lazy: Metal's metal_snap_lazy, the call
+         * only where tex_scale.z != 0 (a [branch]: fxc flattened a plain if).
+         * Default 1 (KFC-1340, 20-nov: -2.4 ms at scale 4 on a Vega 8);
+         * 0/off: the old unconditional call; alt: even flips only */
         static int lazy_mode = -1;
         if (lazy_mode < 0) {
             const char *e = recomp_env(RENV_D3D11_SNAP_LAZY);
-            lazy_mode = !e ? 0 : !_stricmp(e, "alt") ? 2 : e[0] == '1' ? 1 : 0;
-            if (e && !lazy_mode)
+            int off = e && (e[0] == '0' || !_stricmp(e, "off"));
+            lazy_mode = !e ? 1 : off ? 0 : !_stricmp(e, "alt") ? 2 : e[0] == '1' ? 1 : 0;
+            if (e && !lazy_mode && !off)
                 fprintf(stderr, LOGP "d3d11_snap_lazy=%s: not 1 or alt, off\n", e);
-            else if (lazy_mode)
+            else if (lazy_mode && e)
                 fprintf(stderr, LOGP "d3d11_snap_lazy=%s: nv2a_snap_uv only where tex_scale.z != 0\n", e);
         }
         if (no_snap < 0)
