@@ -370,7 +370,10 @@ static void prof_add(uint64_t *acc, uint64_t t0)
  *
  * metal_gpu_blocks adds each pass's GPU time from timestamps sampled at
  * its stage boundaries (the only sampling point Apple GPUs offer: no split
- * between the draws of one pass). A pass is put under its first draw's
+ * between the draws of one pass): its share of the frame's busy time
+ * (gb_sweep), its fragment and vertex stages' own spans beside it. A pass
+ * with no draw, or with only stale samples, is counted, not timed. A pass
+ * is put under its first draw's
  * kind; a pass whose draws are of several kinds is counted as mixed, with
  * its draws by kind in the metal_passes_at line, never split. Off, a site
  * costs the store of its reason and one cached int read. */
@@ -415,11 +418,17 @@ typedef struct {
     uint8_t  after;             /* opened with no pass open: why the last one closed; 0xFF */
     uint8_t  reopen;            /* the same colour target loaded right after its pass closed:
                                  * that close's reason; 0xFF */
+    uint8_t  dc;                /* metal_depth_dontcare opened it DontCare */
     uint32_t draws, clears;
+    uint32_t zdraws;            /* draws testing or writing depth or stencil */
     uint32_t cat_draws[NV2A_GCAT_N];
     PtAtt    att[3];            /* colour, depth, stencil */
     int      gb;                /* its first timestamp slot, -1 none */
-    uint64_t ticks;             /* GPU timestamp ticks, end - start */
+    uint64_t g_open;            /* the GPU's clock when it was encoded: no sample is older */
+    /* gb_resolve: its stages' valid samples in GPU ticks (0: none), and the
+     * time the frame's sweep gave it alone (gb_sweep) */
+    uint64_t sv, ev, sf, ef;    /* vertex, fragment (compute or blit: sf, ef) */
+    uint64_t excl;
 } PtPass;
 typedef struct {
     uint64_t flip;
@@ -445,22 +454,35 @@ static struct {
     uint64_t sus_load, sus_store[3], unknown[3];
     /* metal_gpu_blocks */
     uint64_t cat_ticks[NV2A_GCAT_N], mixed_ticks, gb_passes, gb_missing;
+    uint64_t gb_nodraw, gb_stale;    /* untimed: no draw and no sample; a sample older than the pass */
+    uint64_t span_ticks, idle_ticks; /* the frames' first sample to last, and the gaps in it */
     uint64_t cmd_ns;            /* the command buffers' GPU time (prof_flip_end) */
+    uint64_t dc_passes, dc_miss;     /* metal_depth_dontcare */
 } s_pts;
 static int  s_pt_on = -1, s_pt_log;
+static int  s_pt_track;         /* readers kept: metal_passes, or metal_depth_dontcare's guess */
+static int  s_dc_mode;          /* metal_depth_dontcare: 0 off, 1 on, 2 every other flip */
+static int  s_dc_pass;          /* the open pass's depth and stencil are DontCare */
+static int  s_dc_opener;        /* begin_pass is opened for a draw using neither */
 static long s_pt_at = -1;       /* metal_passes_at */
 static int  s_gb_on = -1;       /* metal_gpu_blocks: sampling */
 static id   s_gb_sb[2];         /* id<MTLCounterSampleBuffer> by flip parity */
 static id   s_gb_cmd[2];        /* the last command buffer sampled into each */
 static uint64_t s_gb_cal_ns, s_gb_cal_gpu;   /* a (host ns, GPU tick) pair */
 
-/* The passes bookkeeping, for either trace. */
+/* The passes bookkeeping, for either trace and for metal_depth_dontcare,
+ * which guesses from it (pt_dc_guess). */
 static int pt_on(void)
 {
     if (s_pt_on < 0) {
+        const char *dc = recomp_env(RENV_METAL_DEPTH_DONTCARE);
+        s_dc_mode = !dc ? 0 : !strcasecmp(dc, "alt") ? 2 : dc[0] == '1' ? 1 : 0;
         s_pt_log = recomp_env(RENV_METAL_PASSES) != NULL;
-        s_pt_on = s_pt_log || recomp_env(RENV_METAL_GPU_BLOCKS) != NULL;
+        s_pt_track = s_pt_log || s_dc_mode;
+        s_pt_on = s_pt_track || recomp_env(RENV_METAL_GPU_BLOCKS) != NULL;
         s_pt_at = s_pt_log ? recomp_env_int(RENV_METAL_PASSES_AT, -1) : -1;
+        if (dc && !s_dc_mode)
+            fprintf(stderr, LOGP "metal_depth_dontcare=%s: not 1 or alt, off\n", dc);
     }
     return s_pt_on;
 }
@@ -521,6 +543,20 @@ static int gb_on(void)
     if (s_gb_on < 0)
         s_gb_on = s_dev && recomp_env(RENV_METAL_GPU_BLOCKS) ? gb_init() : 0;
     return s_gb_on;
+}
+
+/* The GPU's clock now, in the counter samples' ticks. A sample a pass's
+ * stage never wrote keeps what the slot held from an older frame (a clear
+ * pass with no draw writes none: 3586 ms "passes" on the M4), so a sample
+ * older than the pass's encoding is not the pass's. */
+static uint64_t gb_now(void)
+{
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        MTLTimestamp ct = 0, gt = 0;
+        [s_dev sampleTimestamps:&ct gpuTimestamp:&gt];
+        return gt;
+    }
+    return 0;
 }
 
 static void gb_note_cmd(void)
@@ -595,12 +631,32 @@ static PtAtt *ptw_att(int w)
     return &f->p[s_ptw[w].pass].att[s_ptw[w].plane];
 }
 
+/* metal_depth_dontcare: the last pass opened DontCare, until a clear of
+ * its depth; a load or read of that depth before then is a wrong guess. */
+static struct { const void *tex; uint64_t flip; int pass, valid; } s_dc_last;
+
+static void pt_dc_miss(const char *what)
+{
+    static int said;
+    PtFrame *f = &s_ptf[s_dc_last.flip & 1];
+    s_pts.dc_miss++;
+    if (f->flip == s_dc_last.flip && s_dc_last.pass >= 0 && s_dc_last.pass < f->n)
+        f->p[s_dc_last.pass].dc = 2;   /* its twin is not guessed again */
+    if (said++ < 4)
+        fprintf(stderr, LOGP "metal_depth_dontcare: wrong guess at flip %llu: %s after pass #%d"
+                " of flip %llu opened its depth DontCare\n", (unsigned long long)s_presents,
+                what, s_dc_last.pass, (unsigned long long)s_dc_last.flip);
+    s_dc_last.valid = 0;
+}
+
 /* tex's plane (0 colour, 1 depth, 2 stencil) read by `kind`, in pass `by`
  * of this frame (-1: not a pass, or past the table). */
 static void pt_read(const void *tex, int plane, int kind, int by)
 {
     int w = ptw_find(tex, plane);
     PtAtt *a;
+    if (plane && s_dc_last.valid && s_dc_last.tex == tex)
+        pt_dc_miss("its depth read as a texture");
     if (w < 0 || !(a = ptw_att(w)))
         return;
     if (!a->rkind) {
@@ -643,8 +699,10 @@ static void pt_write(const void *tex, int plane, int clear, int by)
     s_ptw[w].pass = (int16_t)by;
 }
 
+/* clear: 0 Load, 1 Clear, 2 DontCare (metal_depth_dontcare); store: 1
+ * Store, 0 DontCare. */
 static void pt_att(PtAtt *a, const void *tex, uint32_t addr, uint32_t w, uint32_t h,
-                   uint32_t hw, uint32_t hh, uint32_t fmt, int clear)
+                   uint32_t hw, uint32_t hh, uint32_t fmt, int clear, int store)
 {
     a->on = 1;
     a->tex = tex;
@@ -655,8 +713,39 @@ static void pt_att(PtAtt *a, const void *tex, uint32_t addr, uint32_t w, uint32_
     a->hh = hh;
     a->fmt = fmt;
     a->clear = (uint8_t)clear;
-    a->store = 1;   /* begin_pass stores every attachment */
+    a->store = (uint8_t)store;
     a->rpass = -1;
+}
+
+static int pt_load(MTLLoadAction l)
+{
+    return l == MTLLoadActionClear ? 1 : l == MTLLoadActionDontCare ? 2 : 0;
+}
+
+/* RECOMP_DEBUG=metal_depth_dontcare: may the pass begin_pass opens on rt
+ * and dt load and store its depth and stencil DontCare? Whether any draw
+ * of it will use them, or a later pass read them before their next clear,
+ * is not known when it opens; so the guess is its twin's, last frame's
+ * pass at the same place on the same colour and depth target: the frame's
+ * last pass (closed at the flip) with no depth or stencil draw, whose
+ * depth and stencil the next frame cleared unread (or the twin was guessed
+ * so itself and nothing proved it wrong). In Kung Fu Chaos's fight that is
+ * the last full-screen pass over the 640x480 frame, #11 of 12. The caller
+ * opens it for a draw using neither (s_dc_opener); a depth or stencil
+ * draw in it ends it, a later read or load is counted (pt_dc_miss). */
+static int pt_dc_guess(const RenderTarget *rt, const DepthTarget *dt)
+{
+    const PtFrame *f = pt_frame(), *pf = &s_ptf[(s_presents + 1) & 1];
+    const PtPass *t;
+    if (s_dc_mode == 2 && (s_presents & 1))
+        return 0;   /* alt: odd flips as before */
+    if (!s_presents || pf->flip != s_presents - 1 || f->n >= pf->n)
+        return 0;
+    t = &pf->p[f->n];
+    return t->kind == PTK_RENDER && t->close_why == PT_FLIP && !t->zdraws && t->dc != 2
+        && t->att[0].tex == (const void *)rt->tex && t->att[1].on
+        && t->att[1].tex == (const void *)dt->tex
+        && (t->dc == 1 || (t->att[1].rkind == PTR_CLEARED && t->att[2].rkind == PTR_CLEARED));
 }
 
 /* begin_pass, its descriptor filled: the pass's record, its writes, and
@@ -667,6 +756,8 @@ static void pt_open(const RenderTarget *rt, const DepthTarget *dt, MTLRenderPass
 {
     int idx, load = rp.colorAttachments[0].loadAction == MTLLoadActionLoad;
     int same = s_pt_last.valid && s_pt_last.flip == s_presents && s_pt_last.tex == (const void *)rt->tex;
+    int zl = dt ? pt_load(rp.depthAttachment.loadAction) : 0;
+    int sl = dt ? pt_load(rp.stencilAttachment.loadAction) : 0;
     PtPass *p = pt_new(PTK_RENDER, why, &idx);
     s_pt_cur = idx;
     s_pt_cur_flip = s_presents;
@@ -677,18 +768,43 @@ static void pt_open(const RenderTarget *rt, const DepthTarget *dt, MTLRenderPass
             p->after = (uint8_t)s_pt_last.why;
         if (load && same)
             p->reopen = (uint8_t)s_pt_last.why;
-        pt_att(&p->att[0], rt->tex, rt->addr, rt->w, rt->h, rt->hw, rt->hh, rt->fmt, !load);
+        pt_att(&p->att[0], rt->tex, rt->addr, rt->w, rt->h, rt->hw, rt->hh, rt->fmt, !load, 1);
         if (dt) {
-            pt_att(&p->att[1], dt->tex, dt->addr, dt->w, dt->h, dt->hw, dt->hh, dt->zfmt,
-                   rp.depthAttachment.loadAction == MTLLoadActionClear);
-            pt_att(&p->att[2], dt->tex, dt->addr, dt->w, dt->h, dt->hw, dt->hh, dt->zfmt,
-                   rp.stencilAttachment.loadAction == MTLLoadActionClear);
+            pt_att(&p->att[1], dt->tex, dt->addr, dt->w, dt->h, dt->hw, dt->hh, dt->zfmt, zl,
+                   rp.depthAttachment.storeAction == MTLStoreActionStore);
+            pt_att(&p->att[2], dt->tex, dt->addr, dt->w, dt->h, dt->hw, dt->hh, dt->zfmt, sl,
+                   rp.stencilAttachment.storeAction == MTLStoreActionStore);
         }
     }
+    /* metal_depth_dontcare's guess: a load of the depth it left alone
+     * before its next clear proves it wrong. */
+    if (dt && s_dc_last.valid && s_dc_last.tex == (const void *)dt->tex && !s_dc_pass) {
+        if (zl == 1 && sl == 1)
+            s_dc_last.valid = 0;   /* cleared: the guess held */
+        else
+            pt_dc_miss("its depth loaded");
+    }
     pt_write(rt->tex, 0, !load, idx);
-    if (dt) {
-        pt_write(dt->tex, 1, rp.depthAttachment.loadAction == MTLLoadActionClear, idx);
-        pt_write(dt->tex, 2, rp.stencilAttachment.loadAction == MTLLoadActionClear, idx);
+    if (dt && !s_dc_pass) {
+        pt_write(dt->tex, 1, zl == 1, idx);
+        pt_write(dt->tex, 2, sl == 1, idx);
+    } else if (dt) {
+        /* DontCare: it neither reads nor writes the depth in memory, so the
+         * last pass that stored it stays its writer */
+        static int said;
+        s_pts.dc_passes++;
+        s_dc_last.tex = dt->tex;
+        s_dc_last.flip = s_presents;
+        s_dc_last.pass = idx;
+        s_dc_last.valid = 1;
+        if (p)
+            p->dc = 1;
+        if (!said++)
+            fprintf(stderr, LOGP "metal_depth_dontcare: flip %llu pass #%d on 0x%08X %ux%u opens"
+                    " its depth and stencil (zeta 0x%08X) DontCare: last frame's pass there was"
+                    " the last, with no depth or stencil draw, and the next frame cleared them"
+                    " unread%s\n", (unsigned long long)s_presents, idx, rt->offset, rt->w, rt->h,
+                    dt->zeta, s_dc_mode == 2 ? " (alt: even flips only)" : "");
     }
     if (p && gb_on()) {
         if (@available(macOS 11.0, iOS 14.0, *)) {
@@ -701,6 +817,7 @@ static void pt_open(const RenderTarget *rt, const DepthTarget *dt, MTLRenderPass
                 a.startOfFragmentSampleIndex = (NSUInteger)base + 2;
                 a.endOfFragmentSampleIndex = (NSUInteger)base + 3;
                 p->gb = base;
+                p->g_open = gb_now();
             }
         }
     }
@@ -787,6 +904,7 @@ static id<MTLComputeCommandEncoder> pt_compute(int why, int cat)
                 a.startOfEncoderSampleIndex = (NSUInteger)base;
                 a.endOfEncoderSampleIndex = (NSUInteger)base + 1;
                 pt_frame()->p[idx].gb = base;
+                pt_frame()->p[idx].g_open = gb_now();
                 return [s_cmd computeCommandEncoderWithDescriptor:cd];
             }
         }
@@ -808,6 +926,7 @@ static id<MTLBlitCommandEncoder> pt_blit(int why, int cat)
                 a.startOfEncoderSampleIndex = (NSUInteger)base;
                 a.endOfEncoderSampleIndex = (NSUInteger)base + 1;
                 pt_frame()->p[idx].gb = base;
+                pt_frame()->p[idx].g_open = gb_now();
                 return [s_cmd blitCommandEncoderWithDescriptor:bd];
             }
         }
@@ -815,9 +934,79 @@ static id<MTLBlitCommandEncoder> pt_blit(int why, int cat)
     return [s_cmd blitCommandEncoder];
 }
 
-/* The frame being judged's timestamps into its passes' ticks. Its command
- * buffers are done (the flip after it waited for later work on the same
- * queue); the last one sampled into is waited for if not. */
+static int gb_u64_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The judged frame's GPU timeline from its passes' stage intervals, shared
+ * out. On a tiler a pass's vertex stage runs ahead, under earlier passes'
+ * fragments: on the M4 every start-of-vertex sample sat near the frame's
+ * start, so start-of-vertex to end-of-fragment grew pass after pass (6.3,
+ * 7.0, 9.9, 13.2 ms in a 14 ms frame) and their sum was several frames. So
+ * each stretch of time goes to the fragment intervals (a compute or blit
+ * encoder's, too) covering it, split evenly; a stretch no fragment covers
+ * goes to the vertex intervals covering it; one nothing covers is idle.
+ * The shares (excl) sum to the intervals' union, the frame's busy GPU time,
+ * which is what the command buffers' total is set against. */
+static void gb_sweep(PtFrame *f)
+{
+    static uint64_t b[PT_MAX * 4];
+    int nb = 0, i, j;
+    uint64_t busy = 0;
+    for (i = 0; i < f->n; i++) {
+        const PtPass *p = &f->p[i];
+        if (p->sf) {
+            b[nb++] = p->sf;
+            b[nb++] = p->ef;
+        }
+        if (p->sv) {
+            b[nb++] = p->sv;
+            b[nb++] = p->ev;
+        }
+    }
+    if (nb < 2)
+        return;
+    qsort(b, (size_t)nb, sizeof b[0], gb_u64_cmp);
+    for (j = 0; j + 1 < nb; j++) {
+        uint64_t s = b[j], e = b[j + 1];
+        int nf = 0, nv = 0;
+        if (e == s)
+            continue;
+        for (i = 0; i < f->n; i++) {
+            const PtPass *p = &f->p[i];
+            if (p->sf && p->sf <= s && p->ef >= e)
+                nf++;
+            else if (p->sv && p->sv <= s && p->ev >= e)
+                nv++;
+        }
+        if (!nf && !nv)
+            continue;   /* idle */
+        busy += e - s;
+        for (i = 0; i < f->n; i++) {
+            PtPass *p = &f->p[i];
+            if (nf ? p->sf && p->sf <= s && p->ef >= e : p->sv && p->sv <= s && p->ev >= e)
+                p->excl += (e - s) / (uint64_t)(nf ? nf : nv);
+        }
+    }
+    s_pts.span_ticks += b[nb - 1] - b[0];
+    s_pts.idle_ticks += b[nb - 1] - b[0] - busy;
+    for (i = 0; i < f->n; i++) {
+        const PtPass *p = &f->p[i];
+        if (!p->sf && !p->sv)
+            continue;
+        s_pts.gb_passes++;
+        s_pts.cat_ticks[p->cat] += p->excl;
+        if (p->mixed)
+            s_pts.mixed_ticks += p->excl;
+    }
+}
+
+/* The frame being judged's timestamps into its passes' stage intervals
+ * (gb_sweep shares them out). Its command buffers are done (the flip after
+ * it waited for later work on the same queue); the last one sampled into
+ * is waited for if not. */
 static void gb_resolve(PtFrame *f)
 {
     int k = (int)(f->flip & 1), i;
@@ -841,34 +1030,88 @@ static void gb_resolve(PtFrame *f)
                 return;
             }
             ts = (const MTLCounterResultTimestamp *)[d bytes];
-            for (i = 0; i < f->n; i++) {
-                PtPass *p = &f->p[i];
-                uint64_t lo = UINT64_MAX, hi = 0;
-                int j, n = p->kind == PTK_RENDER ? 4 : 2;
-                if (p->gb < 0) {
-                    if (p->kind != PTK_AUX)
-                        s_pts.gb_missing++;
-                    continue;
+            {
+                /* Should the GPU clock gb_now reads and the samples not
+                 * share a base after all (every written sample "older" than
+                 * its pass), a sample more than 50 M ticks (50 ms at the
+                 * M4's 1 ns) older than the frame's newest is the stale one
+                 * instead. */
+                static int clock_bad;
+                uint64_t g_end = gb_now(), newest = 0;
+                int nz = 0, ok = 0;
+                for (i = 0; i < f->n; i++) {
+                    const PtPass *p = &f->p[i];
+                    int j, n = p->kind == PTK_RENDER ? 4 : 2;
+                    if (p->gb < 0 || (p->kind == PTK_RENDER && !p->draws && !p->clears))
+                        continue;
+                    for (j = 0; j < n; j++) {
+                        uint64_t x = ts[p->gb + j].timestamp;
+                        if (x == MTLCounterErrorValue || !x)
+                            continue;
+                        nz++;
+                        if (x > newest)
+                            newest = x;
+                        if ((!p->g_open || x >= p->g_open) && x <= g_end)
+                            ok++;
+                    }
                 }
-                for (j = 0; j < n; j++) {
-                    uint64_t v = ts[p->gb + j].timestamp;
-                    if (v == MTLCounterErrorValue || !v)
-                        continue;   /* a stage the pass never ran */
-                    if (v < lo)
-                        lo = v;
-                    if (v > hi)
-                        hi = v;
+                if (nz && !ok && !clock_bad) {
+                    clock_bad = 1;
+                    fprintf(stderr, LOGP "metal_gpu_blocks: no sample of flip %llu is newer than"
+                            " its pass's encoding by sampleTimestamps: stale samples taken as those"
+                            " 50 M ticks older than the frame's newest from here on\n",
+                            (unsigned long long)f->flip);
                 }
-                if (hi <= lo) {
-                    s_pts.gb_missing++;
-                    continue;
+                for (i = 0; i < f->n; i++) {
+                    PtPass *p = &f->p[i];
+                    uint64_t v[4];
+                    int j, n = p->kind == PTK_RENDER ? 4 : 2, stale = 0;
+                    p->sv = p->ev = p->sf = p->ef = p->excl = 0;
+                    if (p->gb < 0) {
+                        if (p->kind != PTK_AUX)
+                            s_pts.gb_missing++;
+                        continue;
+                    }
+                    /* No draw: its stages may write no sample, or some; its
+                     * load and store work shows in no stage's interval
+                     * either. Counted, not timed. */
+                    if (p->kind == PTK_RENDER && !p->draws && !p->clears) {
+                        s_pts.gb_nodraw++;
+                        continue;
+                    }
+                    for (j = 0; j < n; j++) {
+                        v[j] = ts[p->gb + j].timestamp;
+                        if (v[j] == MTLCounterErrorValue || !v[j]) {
+                            v[j] = 0;   /* a stage the pass never ran */
+                        } else if (clock_bad ? newest - v[j] > 50000000u
+                                             : (p->g_open && v[j] < p->g_open) || v[j] > g_end) {
+                            v[j] = 0;   /* left from an older frame: never written */
+                            stale = 1;
+                        }
+                    }
+                    /* A stage counts with both its samples, end after start. */
+                    if (n == 4) {
+                        if (v[0] && v[1] && v[1] >= v[0]) {
+                            p->sv = v[0];
+                            p->ev = v[1];
+                        }
+                        if (v[2] && v[3] && v[3] >= v[2]) {
+                            p->sf = v[2];
+                            p->ef = v[3];
+                        }
+                    } else if (v[0] && v[1] && v[1] >= v[0]) {
+                        p->sf = v[0];
+                        p->ef = v[1];
+                    }
+                    if (!p->sf && !p->sv) {
+                        if (stale)
+                            s_pts.gb_stale++;
+                        else
+                            s_pts.gb_missing++;
+                    }
                 }
-                p->ticks = hi - lo;
-                s_pts.cat_ticks[p->cat] += p->ticks;
-                if (p->mixed)
-                    s_pts.mixed_ticks += p->ticks;
-                s_pts.gb_passes++;
             }
+            gb_sweep(f);
         }
     }
 }
@@ -919,7 +1162,8 @@ static void pt_print_att(const char *what, const PtAtt *a, char *b, size_t n)
     snprintf(b, n, " | %s 0x%08X %ux%u host %ux%u %s fmt 0x%X x1 load=%s store=%s read: %s"
              " (%u reads)", what, a->addr, a->w, a->h, a->hw, a->hh,
              what[0] == 'c' ? "BGRA8Unorm" : "Depth32Float_Stencil8", a->fmt,
-             a->clear ? "clear" : "load", a->store ? "store" : "dontcare", r, a->nread);
+             a->clear == 1 ? "clear" : a->clear == 2 ? "dontcare" : "load",
+             a->store ? "store" : "dontcare", r, a->nread);
 }
 
 /* metal_passes_at: the judged frame, a line a pass, then its suspects. */
@@ -931,21 +1175,40 @@ static void pt_detail(const PtFrame *f, double nspt)
     fprintf(stderr, LOGP "passes flip %llu: %d passes (%d render, %d render-aux, %d compute,"
             " %d blit), %d past the table\n", (unsigned long long)f->flip, f->n + f->over,
             f->nk[PTK_RENDER], f->nk[PTK_AUX], f->nk[PTK_COMPUTE], f->nk[PTK_BLIT], f->over);
+    uint64_t t0 = UINT64_MAX;
+    double ms = (nspt > 0 ? nspt : 1.0) / 1e6;   /* uncalibrated: a tick taken as a ns */
     for (i = 0; i < f->n; i++) {
         const PtPass *p = &f->p[i];
-        char gpu[48] = "";
-        if (p->ticks && nspt > 0)
-            snprintf(gpu, sizeof gpu, " gpu %.3f ms", p->ticks * nspt / 1e6);
-        else if (p->ticks)
-            snprintf(gpu, sizeof gpu, " gpu %llu ticks", (unsigned long long)p->ticks);
+        if (p->sv && p->sv < t0)
+            t0 = p->sv;
+        if (p->sf && p->sf < t0)
+            t0 = p->sf;
+    }
+    for (i = 0; i < f->n; i++) {
+        const PtPass *p = &f->p[i];
+        char gpu[160] = "";
+        /* excl: its share of the frame's busy time (gb_sweep); frag and
+         * vtx: its stages' own end - start; "at": from the frame's first
+         * sample, ms */
+        if (p->sf || p->sv)
+            snprintf(gpu, sizeof gpu, " gpu %.3f ms (frag %.3f at +%.3f, vtx %.3f at +%.3f)%s",
+                     p->excl * ms, p->sf ? (p->ef - p->sf) * ms : 0.0,
+                     p->sf ? (p->sf - t0) * ms : 0.0, p->sv ? (p->ev - p->sv) * ms : 0.0,
+                     p->sv ? (p->sv - t0) * ms : 0.0, nspt > 0 ? "" : " uncalibrated");
+        else if (p->gb >= 0)
+            snprintf(gpu, sizeof gpu, " gpu untimed (%s)",
+                     p->kind == PTK_RENDER && !p->draws && !p->clears ? "no draw"
+                                                                       : "no valid sample");
         for (k = 0; k < 3; k++)
             pt_print_att(plane[k], &p->att[k], at[k], sizeof at[k]);
         fprintf(stderr, LOGP "pass %llu #%d %s open=%s%s%s close=%s draws %u (%s) clears %u"
-                " kind %s%s%s%s%s%s\n", (unsigned long long)f->flip, i, s_ptk_name[p->kind],
-                s_pt_why_name[p->open_why], p->after != 0xFF ? " after " : "",
+                " (%u depth or stencil) kind %s%s%s%s%s%s%s\n", (unsigned long long)f->flip, i,
+                s_ptk_name[p->kind], s_pt_why_name[p->open_why], p->after != 0xFF ? " after " : "",
                 p->after != 0xFF ? s_pt_why_name[p->after] : "", s_pt_why_name[p->close_why],
-                p->draws, pt_cat_draws(p, cd, sizeof cd), p->clears, nv2a_gpu_cat_name(p->cat),
-                p->mixed ? " (mixed)" : "", gpu,
+                p->draws, pt_cat_draws(p, cd, sizeof cd), p->clears, p->zdraws,
+                nv2a_gpu_cat_name(p->cat), p->mixed ? " (mixed)" : "",
+                p->dc == 1 ? " depth-dontcare" : p->dc == 2 ? " depth-dontcare (wrong guess)" : "",
+                gpu,
                 p->kind == PTK_RENDER ? at[0] : "", p->kind == PTK_RENDER ? at[1] : "",
                 p->kind == PTK_RENDER ? at[2] : "");
     }
@@ -1083,16 +1346,27 @@ static void pt_judge(PtFrame *f)
                 at += (size_t)snprintf(line + at, sizeof line - at, "%s%s %.3f", k ? " + " : "",
                                        nv2a_gpu_cat_name(k), ms);
             }
-            fprintf(stderr, LOGP "gpu blocks over %d flips (ms/frame): %s = %.3f by pass (mixed"
-                    " passes %.3f of it); command buffers %.3f, passes - buffers %+.3f (a tiler"
-                    " overlaps one pass's vertex work with another's fragments; render-aux"
-                    " encoders are not timed); %s %.3f ns/tick; %llu passes timed, %llu without"
-                    " timestamps\n", s_pts.flips, line, sum,
-                    s_pts.mixed_ticks * scale / n / 1e6, s_pts.cmd_ns / n / 1e6,
+            /* Each pass's share of its frame's busy time (gb_sweep): the
+             * blocks sum to the busy time, set against the command buffers'
+             * GPUStartTime-GPUEndTime, which also holds the idle gaps and
+             * the untimed work (passes with no draw, render-aux encoders). */
+            fprintf(stderr, LOGP "gpu blocks over %d flips (ms/frame): %s = %.3f busy (mixed"
+                    " passes %.3f of it), %.3f idle in a %.3f span from the first sample to the"
+                    " last; command buffers %.3f, busy - buffers %+.3f; %s %.3f ns/tick; %llu"
+                    " passes timed, untimed: %llu with no draw, %llu with only stale samples,"
+                    " %llu without timestamps\n", s_pts.flips, line, sum,
+                    s_pts.mixed_ticks * scale / n / 1e6, s_pts.idle_ticks * scale / n / 1e6,
+                    s_pts.span_ticks * scale / n / 1e6, s_pts.cmd_ns / n / 1e6,
                     sum - s_pts.cmd_ns / n / 1e6, r > 0 ? "calibrated" : "UNCALIBRATED, taken as",
                     scale, (unsigned long long)s_pts.gb_passes,
+                    (unsigned long long)s_pts.gb_nodraw, (unsigned long long)s_pts.gb_stale,
                     (unsigned long long)s_pts.gb_missing);
         }
+        if (s_dc_mode)
+            fprintf(stderr, LOGP "metal_depth_dontcare over %d flips: %llu passes opened depth"
+                    " DontCare, %llu wrong guesses%s\n", s_pts.flips,
+                    (unsigned long long)s_pts.dc_passes, (unsigned long long)s_pts.dc_miss,
+                    s_dc_mode == 2 ? " (alt: even flips only)" : "");
         memset(&s_pts, 0, sizeof s_pts);
     }
 }
@@ -1152,6 +1426,7 @@ static void end_encoder(void)
         s_enc = nil;
     }
     s_pt_why = PT_UNTAGGED;   /* consumed, whether a pass was open or not */
+    s_dc_pass = 0;
     s_enc_rt = NULL;
     s_enc_dt = NULL;
 }
@@ -1237,6 +1512,16 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
         rp.stencilAttachment.loadAction = sc ? MTLLoadActionClear : MTLLoadActionLoad;
         rp.stencilAttachment.clearStencil = (zmask & 2u) ? (st & 0xFFu) : 0u;
         dt->fresh = 0;
+        /* RECOMP_DEBUG=metal_depth_dontcare (pt_dc_guess): neither loaded
+         * into tile memory nor stored back. s_dc_opener is only ever set
+         * with the switch on. */
+        if (s_dc_opener && !zc && !sc && pt_dc_guess(rt, dt)) {
+            rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+            rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+            rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
+            rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+            s_dc_pass = 1;
+        }
     }
     rp.visibilityResultBuffer = s_vis;
     if (pt_on())
@@ -3887,7 +4172,7 @@ static RenderTarget *zt_texture(DepthTarget *d, const Stage *t)
         if (pt_on()) {
             /* metal_passes: the depth and stencil stores' reader */
             c = pt_compute(PT_ZTEX, NV2A_GCAT_ZTEX);
-            if (s_pt_log) {
+            if (s_pt_track) {
                 pt_read(d->tex, 1, PTR_ZTEX, s_pt_aux);
                 pt_read(d->tex, 2, PTR_ZTEX, s_pt_aux);
             }
@@ -3994,7 +4279,7 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
         ensure_cmd();
         if (pt_on()) {
             b = pt_blit(PT_SELF_COPY, NV2A_GCAT_OTHER);
-            if (s_pt_log)
+            if (s_pt_track)
                 pt_read(self->tex, 0, PTR_BLIT, s_pt_aux);
         } else {
             b = [s_cmd blitCommandEncoder];
@@ -4150,7 +4435,7 @@ static void aspect_log_post(uint32_t hash, const RenderTarget *rt, int place)
  * the whole colour target": no blend, every channel written, at most two
  * triangles, the surface clip the whole target. */
 static void pt_draw(const RenderTarget *rt, const RenderTarget *const srcs[4], int depth_test,
-                    uint32_t nidx)
+                    int zuse, uint32_t nidx)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     uint32_t mw = 0, mh = 0, b[4];
@@ -4163,7 +4448,7 @@ static void pt_draw(const RenderTarget *rt, const RenderTarget *const srcs[4], i
             zt = 1;
             continue;
         }
-        if (s != &s_self && s_pt_log)
+        if (s != &s_self && s_pt_track)
             pt_read(s->tex, 0, PTR_TEXTURE, s_pt_cur);
         if (!mw || s->w * s->h < mw * mh) {
             mw = s->w;
@@ -4173,6 +4458,11 @@ static void pt_draw(const RenderTarget *rt, const RenderTarget *const srcs[4], i
     full = !g->blend_enable && g->color_keep == 0 && nidx <= 6
         && nv2a_draw_box(g, rt->w, rt->h, b) && !b[0] && !b[1] && b[2] == rt->w && b[3] == rt->h;
     pt_note_draw(nv2a_gpu_cat_draw(rt->w, rt->h, depth_test, zt, mw, mh), full);
+    if (zuse) {
+        PtPass *p = pt_cur_pass();
+        if (p)
+            p->zdraws++;   /* metal_depth_dontcare's guess reads it */
+    }
 }
 
 static void metal_on_draw(const struct nv2a_pb_draw *d)
@@ -4412,6 +4702,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     PT_WHY(PT_DEPTH);
                     end_encoder();
                 }
+            } else if (s_dc_pass && s_enc_rt == rt) {
+                /* metal_depth_dontcare guessed no depth draw in this pass:
+                 * it ends, and the next opens loading the depth (only ever
+                 * set with the switch on) */
+                pt_dc_miss("a depth or stencil draw in its pass");
+                PT_WHY(PT_DEPTH);
+                end_encoder();
             }
             /* A plain-z depth batch on a buffer in RECOMP_W_EARLYZ's mode
              * has no fix this frame: the mode goes off from the next depth
@@ -4598,7 +4895,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
 
         if (!s_enc || s_enc_rt != rt) {
             PT_WHY(s_enc ? PT_TARGET : PT_RESUME);
+            /* metal_depth_dontcare: a pass opened for a draw using neither
+             * depth nor stencil may leave them out of tile memory */
+            s_dc_opener = !use_z && pt_on() && s_dc_mode;
             begin_encoder(rt, 0, NULL);
+            s_dc_opener = 0;
         }
         pso = pipeline(vfn, ffn);
         if (!pso) {
@@ -4743,7 +5044,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         else if (nv2a_tex_mag_on() && !d->program && topo == NV2A_TOPO_TRIANGLES)
             mag_pretransformed(vf, nf4, slot, idx, nidx);
         if (pt_on())
-            pt_draw(rt, srcs, v->depth_enable && s_enc_dt, nidx);   /* metal_passes */
+            pt_draw(rt, srcs, v->depth_enable && s_enc_dt, use_z, nidx);   /* metal_passes */
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         /* After the draw: a later batch sampling this depth converts again,
@@ -4975,7 +5276,7 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
         return;
     guard_open();
     @autoreleasepool {
-        if (pt_on() && s_pt_log)
+        if (pt_on() && s_pt_track)
             pt_read(rt->tex, 0, PTR_READBACK, -1);   /* metal_passes */
         PT_WHY(PT_SYNC);
         rt_managed_sync(rt);
@@ -5889,7 +6190,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 hch = ch * rt->n;
                 s_shown_w = cw;
                 s_shown_h = ch;
-                if (pt_on() && s_pt_log)
+                if (pt_on() && s_pt_track)
                     pt_read(rt->tex, 0, PTR_FLIP, -1);   /* metal_passes */
 #ifdef XBOXRECOMP_ENHANCE
                 dbg_present(rt);
@@ -6238,7 +6539,7 @@ static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
         /* metal_passes: the source's store read, the copy a write of the
          * destination (a partial one keeps the rest: a load) */
         e = pt_blit(PT_BLIT, NV2A_GCAT_OTHER);
-        if (s_pt_log) {
+        if (s_pt_track) {
             pt_read(src->tex, 0, PTR_BLIT, s_pt_aux);
             pt_write(dst->tex, 0, whole, s_pt_aux);
         }

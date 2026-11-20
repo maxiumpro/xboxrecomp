@@ -280,6 +280,7 @@ extern "C" {
     X(D3D11_OCC,         DEBUG, "d3d11_occ",       "RECOMP_D3D11_OCC",         "=sync|fixed: D3D11 occlusion mode") \
     X(METAL_NO_MIPS,     DEBUG, "metal_no_mips",   "RECOMP_METAL_NO_MIPS",     "Metal uploads level 0 only") \
     X(METAL_MEMO,        DEBUG, "metal_memo",      NULL,                       "=0: no Metal per-batch memo (c[] by generation, texture stages)") \
+    X(METAL_DEPTH_DONTCARE, DEBUG, "metal_depth_dontcare", NULL,               "=1: a render pass opened by a draw using no depth or stencil, whose twin last frame (same place, same colour target) was the frame's last pass, closed at the flip, drew nothing with depth or stencil and had them cleared unread by the next frame, loads and stores depth and stencil DontCare; a depth or stencil draw in it ends it (counted); =alt: on even flips only, an in-run A/B (default off)") \
     X(METAL_PASSES_AT,   DEBUG, "metal_passes_at", NULL,                       "=flip: with RECOMP_TRACE=metal_passes, that frame's passes one per line (reasons, draws, attachments with load and store, who reads each later) and its suspects, printed at the end of the next flip") \
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
