@@ -3380,6 +3380,23 @@ static id<MTLFunction> fs_basic(void)
  * samples face 0 as 2D, as before. */
 static int s_fs_comb;
 
+/* RECOMP_DEBUG=metal_snap_lazy=1|alt (KFC-1340 V1): the combiners call
+ * nv2a_snap_uv only on a stage whose tex_scale.z is not 0, the picture
+ * unchanged; alt: even flips only, an in-run A/B. */
+static int snap_lazy_now(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = recomp_env(RENV_METAL_SNAP_LAZY);
+        mode = !e ? 0 : !strcasecmp(e, "alt") ? 2 : e[0] == '1' ? 1 : 0;
+        if (e && !mode)
+            fprintf(stderr, LOGP "metal_snap_lazy=%s: not 1 or alt, off\n", e);
+        else if (mode)
+            fprintf(stderr, LOGP "metal_snap_lazy=%s: nv2a_snap_uv only where tex_scale.z != 0\n", e);
+    }
+    return mode == 1 || (mode == 2 && !(s_presents & 1));
+}
+
 /* fs_select returned the combiners' W variant (nv2a_w_depth_on): the
  * vertex side's W mode 1 (vc.u[7]) and the WDepth buffer go with it, and with
  * nothing else, so a fallback to fs_basic keeps the stock z -- or, on a
@@ -3438,7 +3455,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     key[36] = (nv2a_host_render_scale() > 1 && !no_snap) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
             | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
             | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
-            | (s_fs_mag ? 16u : 0u);   /* the trace's variant */
+            | (s_fs_mag ? 16u : 0u)    /* the trace's variant */
+            | (snap_lazy_now() ? 32u : 0u);   /* RECOMP_DEBUG=metal_snap_lazy */
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
@@ -3448,6 +3466,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
     st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in the hash via st */
+    if (st.rect_snap && (key[36] & 32u))
+        st.rect_snap = 2;   /* metal_snap_lazy: the call only where .z != 0 */
     st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
     st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
     st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */

@@ -327,7 +327,13 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                      "        else x%d = tex%d.sample(samp%d, uv, bias(pc.tex_bias[%d]));\n",
                      i, 8 + i, i, i, 8 + i, i, i, i);
             } else {
-                if (state->rect_snap)
+                /* rect_snap 2 (Metal's metal_snap_lazy): only a stage whose
+                 * .z moves the sample calls it, so a render-target or 3D
+                 * stage (.z 0, the call a no-op) pays no dfdx/dfdy */
+                if (state->rect_snap == 2)
+                    EMIT("        if (pc.tex_scale[%d].z != 0.0)"
+                         " uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i, i);
+                else if (state->rect_snap)
                     EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i);
                 if (state->rt_offset)
                     /* hor+: tex_scale.w moves a centred batch's read into the
