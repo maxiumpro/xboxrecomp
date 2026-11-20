@@ -419,6 +419,11 @@ typedef struct {
     uint8_t  reopen;            /* the same colour target loaded right after its pass closed:
                                  * that close's reason; 0xFF */
     uint8_t  dc;                /* metal_depth_dontcare opened it DontCare */
+    /* The shader of its first draw (pt_shader), for metal_passes_at: the
+     * fragment function's FNV-1a (its pointer, the pipeline key's fs), the
+     * stages sampling a texture, their host sizes, nv2a_snap_uv in play */
+    uint8_t  sh_set, nstages, snap;
+    uint32_t fs_id, tw[4], th[4];
     uint32_t draws, clears;
     uint32_t zdraws;            /* draws testing or writing depth or stencil */
     uint32_t cat_draws[NV2A_GCAT_N];
@@ -458,10 +463,16 @@ static struct {
     uint64_t span_ticks, idle_ticks; /* the frames' first sample to last, and the gaps in it */
     uint64_t cmd_ns;            /* the command buffers' GPU time (prof_flip_end) */
     uint64_t dc_passes, dc_miss;     /* metal_depth_dontcare */
+    uint64_t fh_draws;               /* metal_flat_half: draws scissored */
+    uint64_t cpu_n;                  /* metal_gpu_blocks: frames with a scene pass, */
+    double   cpu_sum_ms, cpu_max_ms; /* its close to the flip's commit */
 } s_pts;
 static int  s_pt_on = -1, s_pt_log;
 static int  s_pt_track;         /* readers kept: metal_passes, or metal_depth_dontcare's guess */
 static int  s_dc_mode;          /* metal_depth_dontcare: 0 off, 1 on, 2 every other flip */
+static int  s_fh_mode;          /* metal_flat_half: 0 off, 1 on, 2 every other flip */
+static uint64_t s_scene_close_ns;   /* metal_gpu_blocks: the last scene or mixed pass's close; 0 none */
+static MTLScissorRect s_draw_sr;    /* the open draw's scissor (metal_flat_half re-sets it) */
 static int  s_dc_pass;          /* the open pass's depth and stencil are DontCare */
 static int  s_dc_opener;        /* begin_pass is opened for a draw using neither */
 static long s_pt_at = -1;       /* metal_passes_at */
@@ -479,10 +490,14 @@ static int pt_on(void)
         s_dc_mode = !dc ? 0 : !strcasecmp(dc, "alt") ? 2 : dc[0] == '1' ? 1 : 0;
         s_pt_log = recomp_env(RENV_METAL_PASSES) != NULL;
         s_pt_track = s_pt_log || s_dc_mode;
-        s_pt_on = s_pt_track || recomp_env(RENV_METAL_GPU_BLOCKS) != NULL;
+        const char *fh = recomp_env(RENV_METAL_FLAT_HALF);
+        s_fh_mode = !fh ? 0 : !strcasecmp(fh, "alt") ? 2 : fh[0] == '1' ? 1 : 0;
+        s_pt_on = s_pt_track || s_fh_mode || recomp_env(RENV_METAL_GPU_BLOCKS) != NULL;
         s_pt_at = s_pt_log ? recomp_env_int(RENV_METAL_PASSES_AT, -1) : -1;
         if (dc && !s_dc_mode)
             fprintf(stderr, LOGP "metal_depth_dontcare=%s: not 1 or alt, off\n", dc);
+        if (fh && !s_fh_mode)
+            fprintf(stderr, LOGP "metal_flat_half=%s: not 1 or alt, off\n", fh);
     }
     return s_pt_on;
 }
@@ -839,6 +854,10 @@ static void pt_close(void)
         PtPass *p = &f->p[s_pt_cur];
         p->close_why = (uint8_t)s_pt_why;
         s_pt_last.tex = p->att[0].tex;
+        /* metal_gpu_blocks: the CPU time from the last scene pass's close to
+         * the flip's commit (flush) */
+        if (s_gb_on > 0 && (p->cat == NV2A_GCAT_SCENE || p->mixed) && p->draws)
+            s_scene_close_ns = prof_now();
     }
     s_pt_cur = -1;
 }
@@ -1189,7 +1208,7 @@ static void pt_detail(const PtFrame *f, double nspt)
     }
     for (i = 0; i < f->n; i++) {
         const PtPass *p = &f->p[i];
-        char gpu[160] = "";
+        char gpu[160] = "", sh[96];
         /* excl: its share of the frame's busy time (gb_sweep); frag and
          * vtx: its stages' own end - start; "at": from the frame's first
          * sample, ms */
@@ -1204,8 +1223,19 @@ static void pt_detail(const PtFrame *f, double nspt)
                                                                        : "no valid sample");
         for (k = 0; k < 3; k++)
             pt_print_att(plane[k], &p->att[k], at[k], sizeof at[k]);
+        /* the first draw's shader: fs, stages, host size of each, UV snap */
+        sh[0] = 0;
+        if (p->kind == PTK_RENDER && p->sh_set) {
+            size_t sn = (size_t)snprintf(sh, sizeof sh, " | fs 0x%08X stages %u tex", p->fs_id,
+                                         p->nstages);
+            for (k = 0; k < 4; k++)
+                if (p->tw[k] && sn < sizeof sh)
+                    sn += (size_t)snprintf(sh + sn, sizeof sh - sn, " %ux%u", p->tw[k], p->th[k]);
+            if (sn < sizeof sh)
+                snprintf(sh + sn, sizeof sh - sn, " snap %u", p->snap);
+        }
         fprintf(stderr, LOGP "pass %llu #%d %s open=%s%s%s close=%s draws %u (%s) clears %u"
-                " (%u depth or stencil) kind %s%s%s%s%s%s%s\n", (unsigned long long)f->flip, i,
+                " (%u depth or stencil) kind %s%s%s%s%s%s%s%s\n", (unsigned long long)f->flip, i,
                 s_ptk_name[p->kind], s_pt_why_name[p->open_why], p->after != 0xFF ? " after " : "",
                 p->after != 0xFF ? s_pt_why_name[p->after] : "", s_pt_why_name[p->close_why],
                 p->draws, pt_cat_draws(p, cd, sizeof cd), p->clears, p->zdraws,
@@ -1213,7 +1243,7 @@ static void pt_detail(const PtFrame *f, double nspt)
                 p->dc == 1 ? " depth-dontcare" : p->dc == 2 ? " depth-dontcare (wrong guess)" : "",
                 gpu,
                 p->kind == PTK_RENDER ? at[0] : "", p->kind == PTK_RENDER ? at[1] : "",
-                p->kind == PTK_RENDER ? at[2] : "");
+                p->kind == PTK_RENDER ? at[2] : "", sh);
     }
     for (i = 0; i < f->n; i++) {
         const PtPass *p = &f->p[i];
@@ -1365,6 +1395,14 @@ static void pt_judge(PtFrame *f)
                     (unsigned long long)s_pts.gb_nodraw, (unsigned long long)s_pts.gb_stale,
                     (unsigned long long)s_pts.gb_missing);
         }
+        if (s_gb_on > 0 && s_pts.cpu_n)
+            fprintf(stderr, LOGP "cpu after scene over %d flips: mean %.3f ms, max %.3f ms (scene"
+                    " pass close to flip commit)\n", s_pts.flips,
+                    s_pts.cpu_sum_ms / (double)s_pts.cpu_n, s_pts.cpu_max_ms);
+        if (s_fh_mode)
+            fprintf(stderr, LOGP "metal_flat_half over %d flips: %llu draws clamped%s\n",
+                    s_pts.flips, (unsigned long long)s_pts.fh_draws,
+                    s_fh_mode == 2 ? " (alt: even flips only)" : "");
         if (s_dc_mode)
             fprintf(stderr, LOGP "metal_depth_dontcare over %d flips: %llu passes opened depth"
                     " DontCare, %llu wrong guesses%s\n", s_pts.flips,
@@ -1438,6 +1476,7 @@ static void end_encoder(void)
  * until the GPU is done with it. After a wait the rings are free again. */
 static void flush(int wait)
 {
+    int flipping = s_pt_why == PT_FLIP;   /* end_encoder consumes it */
     end_encoder();
     if (!s_cmd) {
         if (wait) {            /* nothing in flight: the rings are free */
@@ -1448,6 +1487,14 @@ static void flush(int wait)
         return;
     }
     [s_cmd commit];
+    if (flipping && s_gb_on > 0 && s_scene_close_ns) {
+        double ms = (prof_now() - s_scene_close_ns) / 1e6;
+        s_pts.cpu_n++;
+        s_pts.cpu_sum_ms += ms;
+        if (ms > s_pts.cpu_max_ms)
+            s_pts.cpu_max_ms = ms;
+        s_scene_close_ns = 0;
+    }
     [s_last_cmd release];
     s_last_cmd = [s_cmd retain];
     if (wait) {
@@ -4437,12 +4484,12 @@ static void aspect_log_post(uint32_t hash, const RenderTarget *rt, int place)
  * the self copy's its blit). The load heuristic's "the first draw covers
  * the whole colour target": no blend, every channel written, at most two
  * triangles, the surface clip the whole target. */
-static void pt_draw(const RenderTarget *rt, const RenderTarget *const srcs[4], int depth_test,
-                    int zuse, uint32_t nidx)
+static int pt_draw(const RenderTarget *rt, const RenderTarget *const srcs[4], int depth_test,
+                   int zuse, uint32_t nidx)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     uint32_t mw = 0, mh = 0, b[4];
-    int zt = 0, k, full;
+    int zt = 0, k, full, cat;
     for (k = 0; k < 4; k++) {
         const RenderTarget *s = srcs[k];
         if (!s)
@@ -4460,12 +4507,37 @@ static void pt_draw(const RenderTarget *rt, const RenderTarget *const srcs[4], i
     }
     full = !g->blend_enable && g->color_keep == 0 && nidx <= 6
         && nv2a_draw_box(g, rt->w, rt->h, b) && !b[0] && !b[1] && b[2] == rt->w && b[3] == rt->h;
-    pt_note_draw(nv2a_gpu_cat_draw(rt->w, rt->h, depth_test, zt, mw, mh), full);
+    cat = nv2a_gpu_cat_draw(rt->w, rt->h, depth_test, zt, mw, mh);
+    pt_note_draw(cat, full);
     if (zuse) {
         PtPass *p = pt_cur_pass();
         if (p)
             p->zdraws++;   /* metal_depth_dontcare's guess reads it */
     }
+    /* RECOMP_DEBUG=metal_flat_half: a whole-target flat draw gets half the
+     * pixels (the caller sets the scissor); =alt, even flips only */
+    return s_fh_mode && cat == NV2A_GCAT_FLAT && full && !(s_fh_mode == 2 && (s_presents & 1));
+}
+
+/* metal_passes_at: the shader of the pass's first draw (see PtPass). stex:
+ * the batch's stage textures, s_black where a stage samples nothing; snap:
+ * the combiners' function with render.scale above 1 (nv2a_snap_uv, key[36]). */
+static void pt_shader(id<MTLFunction> ffn, id<MTLTexture> const stex[4], int snap)
+{
+    PtPass *p = pt_cur_pass();
+    uintptr_t fp = (uintptr_t)ffn;
+    int k;
+    if (!p || p->sh_set || !p->draws)
+        return;
+    p->sh_set = 1;
+    p->fs_id = fnv(&fp, sizeof fp);
+    p->snap = (uint8_t)(snap != 0);
+    for (k = 0; k < 4; k++)
+        if (stex[k] && stex[k] != s_black) {
+            p->nstages++;
+            p->tw[k] = (uint32_t)[stex[k] width];
+            p->th[k] = (uint32_t)[stex[k] height];
+        }
 }
 
 static void metal_on_draw(const struct nv2a_pb_draw *d)
@@ -4934,6 +5006,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             sr.width = hb[2] - hb[0];
             sr.height = hb[3] - hb[1];
             [s_enc setScissorRect:sr];
+            s_draw_sr = sr;
         }
         [s_enc setFrontFacingWinding:v->front_face != 0x900
                                      ? MTLWindingCounterClockwise : MTLWindingClockwise];
@@ -5046,8 +5119,21 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             mag_draw();
         else if (nv2a_tex_mag_on() && !d->program && topo == NV2A_TOPO_TRIANGLES)
             mag_pretransformed(vf, nf4, slot, idx, nidx);
-        if (pt_on())
-            pt_draw(rt, srcs, v->depth_enable && s_enc_dt, use_z, nidx);   /* metal_passes */
+        if (pt_on()) {
+            int half = pt_draw(rt, srcs, v->depth_enable && s_enc_dt, use_z, nidx);   /* metal_passes */
+            pt_shader(ffn, stex, s_fs_comb && nv2a_host_render_scale() > 1);
+            if (half) {
+                /* metal_flat_half: this draw only; the next sets its own scissor */
+                MTLScissorRect hs = s_draw_sr;
+                NSUInteger lim = rt->hw / 2u;
+                if (hs.x >= lim)
+                    hs.x = 0;
+                if (hs.x + hs.width > lim)
+                    hs.width = lim - hs.x > 0 ? lim - hs.x : 1;
+                [s_enc setScissorRect:hs];
+                s_pts.fh_draws++;
+            }
+        }
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         /* After the draw: a later batch sampling this depth converts again,
