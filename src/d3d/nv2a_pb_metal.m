@@ -743,7 +743,10 @@ static int pt_dc_guess(const RenderTarget *rt, const DepthTarget *dt)
         return 0;
     t = &pf->p[f->n];
     return t->kind == PTK_RENDER && t->close_why == PT_FLIP && !t->zdraws && t->dc != 2
-        && t->att[0].tex == (const void *)rt->tex && t->att[1].on
+        /* the colour by its shape, not its texture: the frame's last pass
+         * draws into the back buffer, which swaps with the front every flip */
+        && t->att[0].w == rt->w && t->att[0].h == rt->h && t->att[0].fmt == rt->fmt
+        && t->att[1].on
         && t->att[1].tex == (const void *)dt->tex
         && (t->dc == 1 || (t->att[1].rkind == PTR_CLEARED && t->att[2].rkind == PTR_CLEARED));
 }
