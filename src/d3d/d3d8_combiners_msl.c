@@ -192,7 +192,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     else
         EMIT("%s", D3D8_MSL_VOUT);
     EMIT("%s", s_rc_helpers);
-    if (state->rect_snap)
+    /* rect_snap 3 | mask << 4 (metal_snap_lazy=2): no stage left, no helper */
+    if (state->rect_snap && (state->rect_snap < 3 || state->rect_snap >> 4))
         EMIT("%s", D3D8_MSL_SNAP_UV);
     if (state->rect_snap && state->snap_2d)
         EMIT("%s", D3D8_MSL_SNAP_2D);
@@ -329,8 +330,13 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             } else {
                 /* rect_snap 2 (Metal's metal_snap_lazy): only a stage whose
                  * .z moves the sample calls it, so a render-target or 3D
-                 * stage (.z 0, the call a no-op) pays no dfdx/dfdy */
-                if (state->rect_snap == 2)
+                 * stage (.z 0, the call a no-op) pays no dfdx/dfdy. 3 | mask
+                 * << 4 (metal_snap_lazy=2): the backend saw this draw's .z,
+                 * so a stage out of the mask has no call and no guard. */
+                if (state->rect_snap >= 3) {
+                    if (state->rect_snap >> (4 + i) & 1)
+                        EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i);
+                } else if (state->rect_snap == 2)
                     EMIT("        if (pc.tex_scale[%d].z != 0.0)"
                          " uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i, i);
                 else if (state->rect_snap)

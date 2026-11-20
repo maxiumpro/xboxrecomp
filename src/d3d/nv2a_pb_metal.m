@@ -3382,19 +3382,43 @@ static int s_fs_comb;
 
 /* RECOMP_DEBUG=metal_snap_lazy=1|alt (KFC-1340 V1): the combiners call
  * nv2a_snap_uv only on a stage whose tex_scale.z is not 0, the picture
- * unchanged; alt: even flips only, an in-run A/B. */
+ * unchanged; alt: even flips only, an in-run A/B. =2|alt2 (V2): the call
+ * only on the stages of s_snap_mask and none at all elsewhere, no guard
+ * for the compiler to keep the derivatives under. Returns 0 off, 1 V1, 2 V2
+ * for this flip. */
 static int snap_lazy_now(void)
 {
     static int mode = -1;
     if (mode < 0) {
         const char *e = recomp_env(RENV_METAL_SNAP_LAZY);
-        mode = !e ? 0 : !strcasecmp(e, "alt") ? 2 : e[0] == '1' ? 1 : 0;
+        mode = !e ? 0 : !strcasecmp(e, "alt") ? 2 : !strcasecmp(e, "alt2") ? 4
+             : e[0] == '1' ? 1 : e[0] == '2' ? 3 : 0;
         if (e && !mode)
-            fprintf(stderr, LOGP "metal_snap_lazy=%s: not 1 or alt, off\n", e);
+            fprintf(stderr, LOGP "metal_snap_lazy=%s: not 1, alt, 2 or alt2, off\n", e);
+        else if (mode >= 3)
+            fprintf(stderr, LOGP "metal_snap_lazy=%s: nv2a_snap_uv only on stages with"
+                    " tex_scale.z != 0, chosen per draw\n", e);
         else if (mode)
             fprintf(stderr, LOGP "metal_snap_lazy=%s: nv2a_snap_uv only where tex_scale.z != 0\n", e);
     }
-    return mode == 1 || (mode == 2 && !(s_presents & 1));
+    if (mode == 1 || (mode == 2 && !(s_presents & 1)))
+        return 1;
+    return mode == 3 || (mode == 4 && !(s_presents & 1)) ? 2 : 0;
+}
+
+/* metal_snap_lazy=2: bit k for a stage whose tex_scale.z is not 0, the
+ * only ones nv2a_snap_uv can move. It depends on nothing else, so the
+ * draws of one state share a function (fs_select_body's key[36] 6..9). */
+static unsigned s_snap_mask;
+
+static unsigned snap_mask(const struct nv2a_ps_consts *pc)
+{
+    unsigned m = 0;
+    int k;
+    for (k = 0; k < 4; k++)
+        if (pc->tex_scale[k][2] != 0.0f)
+            m |= 1u << k;
+    return m;
 }
 
 /* fs_select returned the combiners' W variant (nv2a_w_depth_on): the
@@ -3457,6 +3481,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
             | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
             | (s_fs_mag ? 16u : 0u)    /* the trace's variant */
             | (snap_lazy_now() ? 32u : 0u);   /* RECOMP_DEBUG=metal_snap_lazy */
+    if ((key[36] & 1u) && snap_lazy_now() == 2)   /* V2: bit 10, the stages in 6..9 */
+        key[36] |= 1024u | (s_snap_mask & 15u) << 6;
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
@@ -3467,7 +3493,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
     st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in the hash via st */
     if (st.rect_snap && (key[36] & 32u))
-        st.rect_snap = 2;   /* metal_snap_lazy: the call only where .z != 0 */
+        st.rect_snap = (key[36] & 1024u) ? 3 | (int)(key[36] >> 6 & 15u) << 4
+                     : 2;   /* metal_snap_lazy: the call only where .z != 0 */
     st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
     st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
     st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
@@ -4674,6 +4701,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         w_on = nv2a_w_depth_on(v, d->program != 0, v->rc_set && (v->rc_ctl & 0xFF));
         wz_ez = v->depth_enable && dt_earlyz_peek(rt->w, rt->h);
         wz_fast = wz_ez && w_on && nv2a_w_earlyz_fast(v, d->prim);
+        s_snap_mask = snap_mask(&mpc.b);   /* metal_snap_lazy=2; final below */
         ffn = fs_select(v, w_on && !wz_fast);
         /* spec_ctl.w: 1 the W variant writes the depth; 2 the vertex z is
          * E, on the fast path or for a W batch on such a buffer whose W
@@ -5000,6 +5028,22 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             s_dc_opener = !use_z && pt_on() && s_dc_mode;
             begin_encoder(rt, 0, NULL);
             s_dc_opener = 0;
+        }
+        /* metal_snap_lazy=2: .z is final only here, after the render-target
+         * stages (nv2a_ps_consts_rt) and render.snap_2d; a changed mask picks
+         * the function again. The texture loop and wz_vs read the first
+         * call's s_fs_comb and s_fs_w, so a fallback (FS_MAX, a compile
+         * failure) keeps the first function, whose extra calls on the
+         * render-target stages are no-ops. */
+        if (snap_lazy_now() == 2 && s_fs_comb && snap_mask(&mpc.b) != s_snap_mask) {
+            int comb = s_fs_comb, fw = s_fs_w;
+            id<MTLFunction> fn;
+            s_snap_mask = snap_mask(&mpc.b);
+            fn = fs_select(v, w_on && !wz_fast);
+            if (s_fs_comb)
+                ffn = fn;
+            s_fs_comb = comb;
+            s_fs_w = fw;
         }
         pso = pipeline(vfn, ffn);
         if (!pso) {
