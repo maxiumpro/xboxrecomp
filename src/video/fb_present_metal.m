@@ -867,6 +867,17 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
             return 0;
         dw = (int)[d.texture width];
         dh = (int)[d.texture height];
+        {   /* the pixels the frame really goes out at, once and on each change */
+            static int said_w, said_h;
+            if (dw != said_w || dh != said_h) {
+                int ww = 0, wh = 0;
+                SDL_GetWindowSizeInPixels(win, &ww, &wh);
+                fprintf(stderr, "[PRESENT] drawable %dx%d (window %dx%d px, frame %ux%u%s)\n",
+                        dw, dh, ww, wh, (unsigned)fw, (unsigned)fh, internal ? ", internal" : "");
+                said_w = dw;
+                said_h = dh;
+            }
+        }
         cb = [s_queue commandBuffer];
         rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = d.texture;
