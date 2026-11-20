@@ -273,6 +273,7 @@ extern "C" {
     X(D3D11_MEMO,        DEBUG, "d3d11_memo",      "RECOMP_D3D11_MEMO",        "=0: no D3D11 memo (state shadows, texture stages, stage-loop views)") \
     X(D3D11_NO_CULL,     DEBUG, "d3d11_no_cull",   "RECOMP_D3D11_NO_CULL",     "D3D11 culls nothing") \
     X(D3D11_RECT_SNAP0,  DEBUG, "d3d11_rect_snap0", "RECOMP_D3D11_RECT_SNAP0", "=1: timing probe, changes the picture: the combiners' pixel shaders skip nv2a_snap_uv (its ddx/ddy on every textured stage) at any render.scale (default off)") \
+    X(D3D11_SNAP_LAZY,   DEBUG, "d3d11_snap_lazy", "RECOMP_D3D11_SNAP_LAZY", "=1: the combiners call nv2a_snap_uv only on a stage whose tex_scale.z is not 0 (render-target and 3D stages skip its ddx/ddy; the picture is unchanged); =alt: on even flips only, an in-run A/B (default off)") \
     X(D3D11_CULL_FLIP,   DEBUG, "d3d11_cull_flip", "RECOMP_D3D11_CULL_FLIP",   "D3D11 culls the other winding") \
     X(D3D11_NO_MIPS,     DEBUG, "d3d11_no_mips",   "RECOMP_D3D11_NO_MIPS",     "D3D11 uploads level 0 only") \
     X(D3D11_POINT,       DEBUG, "d3d11_point",     "RECOMP_D3D11_POINT",       "D3D11 point sampling") \

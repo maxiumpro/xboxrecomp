@@ -3865,12 +3865,24 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
          * RECOMP_DEBUG=d3d11_rect_snap0=1: timing probe, no nv2a_snap_uv at
          * any scale (misplaces 2D texels), Metal's metal_rect_snap0 here. */
         static int no_snap = -1;
+        /* RECOMP_DEBUG=d3d11_snap_lazy=1|alt: Metal's metal_snap_lazy, the
+         * call only where tex_scale.z != 0; alt: even flips only */
+        static int lazy_mode = -1;
+        if (lazy_mode < 0) {
+            const char *e = recomp_env(RENV_D3D11_SNAP_LAZY);
+            lazy_mode = !e ? 0 : !_stricmp(e, "alt") ? 2 : e[0] == '1' ? 1 : 0;
+            if (e && !lazy_mode)
+                fprintf(stderr, LOGP "d3d11_snap_lazy=%s: not 1 or alt, off\n", e);
+            else if (lazy_mode)
+                fprintf(stderr, LOGP "d3d11_snap_lazy=%s: nv2a_snap_uv only where tex_scale.z != 0\n", e);
+        }
         if (no_snap < 0)
             no_snap = recomp_env_on(RENV_D3D11_RECT_SNAP0);
         key[36] = (nv2a_host_render_scale() > 1 && !no_snap) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
                 | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
                 | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
-                | (mag_shader(d) ? 16u : 0u);   /* the trace's variant */
+                | (mag_shader(d) ? 16u : 0u)    /* the trace's variant */
+                | (lazy_mode == 1 || (lazy_mode == 2 && !(s_presents & 1)) ? 32u : 0u);   /* d3d11_snap_lazy */
         key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
@@ -3879,6 +3891,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
                                      v->rc_fcw1, modes, &st);
             st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
             st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in rc_hash via st */
+            if (st.rect_snap && (key[36] & 32u))
+                st.rect_snap = 2;   /* d3d11_snap_lazy: the call only where .z != 0 */
             st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
             st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
             st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */

@@ -346,7 +346,13 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                      "        else x%d = tex%d.Sample(samp%d, uv);\n",
                      i, 8 + i, i, i, 8 + i, i, i);
             } else {
-                if (state->rect_snap)
+                /* rect_snap 2 (d3d11_snap_lazy): only a stage whose .z moves
+                 * the sample calls it, so a render-target or 3D stage pays
+                 * no ddx/ddy */
+                if (state->rect_snap == 2)
+                    EMIT("        if (tex_scale[%d].z != 0.0)"
+                         " uv = nv2a_snap_uv(uv, i.pos.xy, tex_scale[%d]);\n", i, i);
+                else if (state->rect_snap)
                     EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, tex_scale[%d]);\n", i);
                 if (state->rt_offset)
                     /* hor+: tex_scale.w moves a centred batch's read into the
