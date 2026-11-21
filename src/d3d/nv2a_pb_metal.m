@@ -70,6 +70,7 @@
 #include <stddef.h>
 #include "recomp_env.h"
 #include "mem_stats.h"
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,9 +208,23 @@ static const void                 *s_stage_tex;
 static uint64_t                    s_stage_reads, s_stage_writes;
 static int                         s_bc;       /* BC1 and BC3 textures sample (pack entries) */
 
-/* Vertex and index rings, reset after every wait (flip or overflow). */
+/* Vertex and index rings, reset after every wait (flip or overflow). Two
+ * copies of each (KFC-1720 H1b, step 2): the flip switches copies
+ * (ring_switch), and a copy is written again only once the last submission
+ * that bound it is done (its last_sub, "Submissions" below). s_vb, s_ib and
+ * the cursors are the active copy's; s_vb and s_ib are not retained here. */
+#define RING_COPIES 2
+static struct {
+    id<MTLBuffer> vb, ib;
+    uint64_t      last_sub;   /* the newest submission that bound this copy, 0 none */
+} s_ring[RING_COPIES];
+static int           s_ring_cur;
+static int           s_ring_guard;   /* the active copy waits its last_sub before its first write */
+static int           s_ring_bound;   /* s_cmd encoded a draw from the active copy */
 static id<MTLBuffer> s_vb, s_ib;
 static NSUInteger    s_vb_size, s_vb_pos, s_ib_size, s_ib_pos;
+static uint64_t      s_ring_switches, s_ring_cuts, s_ring_oversize;
+static int           s_ring_small;   /* RECOMP_DEBUG=metal_ring_small is set */
 
 #define VIS_SLOTS 8192
 
@@ -1481,21 +1496,156 @@ static void end_encoder(void)
     s_enc_dt = NULL;
 }
 
+/* ---- Submissions (KFC-1720 H1b, step 2) -------------------------------------
+ *
+ * Every command buffer committed on s_queue gets a number, 1 up, in commit
+ * order (sub_commit): the frame's (flush) and metal_rt_private's seed blit
+ * (stage_write). Its completed handler, added before the commit, stores the
+ * final status, then the number, into the entry's atomics and then signals
+ * the entry's semaphore; it takes no lock and needs no other thread. The
+ * entry keeps the command buffer retained until the backend's thread
+ * observes the completion (sub_wait, sub_reap), which consumes that signal:
+ * exactly once per number, so an observed entry's status is the handler's.
+ * The metal_gpu_spin kernel's queue is not numbered. */
+#define SUB_TABLE 256u
+typedef struct {
+    id<MTLCommandBuffer> cb;     /* retained until observed; nil: observed or free */
+    uint64_t             n;      /* its number */
+    int                  bad;    /* observed with status Error */
+    dispatch_semaphore_t sem;    /* signalled once per number, by the handler */
+    _Atomic uint64_t     done;   /* n once the handler ran */
+    _Atomic int          err;    /* status Error, stored before done */
+} SubEntry;
+static SubEntry s_sub[SUB_TABLE];
+static uint64_t s_sub_last;     /* the newest number given out, 0 none */
+static uint64_t s_sub_floor;    /* every number up to this one is observed */
+static _Atomic uint64_t s_sub_errs;   /* ended in Error, counted by the handler */
+/* Why a sub_wait blocked: a flush(1)'s own wait (the serial flip's), the
+ * seed blit's, a ring copy's reuse, a full table. */
+enum { SUBW_FLUSH, SUBW_STAGE, SUBW_RING, SUBW_FULL, SUBW_N };
+static uint64_t s_subw_blocked[SUBW_N], s_subw_ns[SUBW_N];
+
+/* The handler has stored (done == n) or is about to: take its signal and
+ * let the command buffer go. */
+static int sub_observe(SubEntry *e)
+{
+    dispatch_semaphore_wait(e->sem, DISPATCH_TIME_FOREVER);
+    e->bad = atomic_load_explicit(&e->err, memory_order_acquire) != 0;
+    [e->cb release];
+    e->cb = nil;
+    return e->bad ? -1 : 1;
+}
+
+/* Observe, oldest first, every submission the handler has finished with. */
+static void sub_reap(void)
+{
+    while (s_sub_floor < s_sub_last) {
+        uint64_t k = s_sub_floor + 1;
+        SubEntry *e = &s_sub[k % SUB_TABLE];
+        if (e->n == k && e->cb) {
+            if (atomic_load_explicit(&e->done, memory_order_acquire) != k)
+                break;
+            sub_observe(e);
+        }
+        s_sub_floor = k;
+    }
+}
+
+/* Block until submission n is complete and its handler has published it:
+ * 1 done, -1 done with status Error. 0 and numbers never given out are
+ * done. Only the backend's thread calls it. */
+static int sub_wait(uint64_t n, int why)
+{
+    SubEntry *e;
+    uint64_t t0;
+    int r;
+    if (!n || n <= s_sub_floor || n > s_sub_last)
+        return 1;
+    e = &s_sub[n % SUB_TABLE];
+    if (e->n != n)
+        return 1;                     /* observed, the entry reused since */
+    if (!e->cb)
+        return e->bad ? -1 : 1;       /* observed */
+    if (atomic_load_explicit(&e->done, memory_order_acquire) == n
+        || [e->cb status] >= MTLCommandBufferStatusCompleted)
+        return sub_observe(e);        /* the GPU is done: at most the handler to come */
+    t0 = prof_now();
+    [e->cb waitUntilCompleted];
+    r = sub_observe(e);               /* the handler's store, not the wait, decides */
+    s_subw_blocked[why]++;
+    s_subw_ns[why] += prof_now() - t0;
+    return r;
+}
+
+/* Every submission up to n, not only n: a ring copy is free once all that
+ * bound it are done, whatever the queue's completion order. */
+static void sub_wait_upto(uint64_t n, int why)
+{
+    if (n > s_sub_last)
+        n = s_sub_last;
+    while (s_sub_floor < n) {
+        sub_wait(s_sub_floor + 1, why);
+        sub_reap();
+    }
+}
+
+/* Number cb, register its completed handler, then commit it. */
+static uint64_t sub_commit(id<MTLCommandBuffer> cb)
+{
+    uint64_t n;
+    SubEntry *e;
+    dispatch_semaphore_t sem;
+    sub_reap();
+    n = s_sub_last + 1;
+    e = &s_sub[n % SUB_TABLE];
+    if (e->cb)                        /* SUB_TABLE numbers back and not observed */
+        sub_wait(e->n, SUBW_FULL);
+    if (!e->sem)
+        e->sem = dispatch_semaphore_create(0);
+    sem = e->sem;
+    e->n = n;
+    e->bad = 0;
+    e->cb = [cb retain];
+    atomic_store_explicit(&e->err, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->done, 0, memory_order_relaxed);
+    s_sub_last = n;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        int bad = [c status] == MTLCommandBufferStatusError;
+        if (bad)
+            atomic_fetch_add_explicit(&s_sub_errs, 1, memory_order_relaxed);
+        atomic_store_explicit(&e->err, bad, memory_order_relaxed);
+        atomic_store_explicit(&e->done, n, memory_order_release);
+        dispatch_semaphore_signal(sem);
+    }];
+    [cb commit];
+    return n;
+}
+
 /* End the open pass, commit the frame's command buffer and (wait) block
  * until the GPU is done with it. After a wait the rings are free again. */
 static void flush(int wait)
 {
     int flipping = s_pt_why == PT_FLIP;   /* end_encoder consumes it */
+    uint64_t n;
     end_encoder();
     if (!s_cmd) {
-        if (wait) {            /* nothing in flight: the rings are free */
+        if (wait) {
+            /* Nothing open, but a commit nobody waited for (a GET_REPORT's,
+             * the layer copy's) may still read the active ring copy: its
+             * last submission first, then the rings are free. */
+            sub_wait_upto(s_ring[s_ring_cur].last_sub, SUBW_RING);
+            s_ring_guard = 0;
             s_vb_pos = 0;
             s_ib_pos = 0;
             s_flushes++;
         }
         return;
     }
-    [s_cmd commit];
+    n = sub_commit(s_cmd);
+    if (s_ring_bound) {
+        s_ring[s_ring_cur].last_sub = n;
+        s_ring_bound = 0;
+    }
     if (flipping && s_gb_on > 0 && s_scene_close_ns) {
         double ms = (prof_now() - s_scene_close_ns) / 1e6;
         s_pts.cpu_n++;
@@ -1507,13 +1657,13 @@ static void flush(int wait)
     [s_last_cmd release];
     s_last_cmd = [s_cmd retain];
     if (wait) {
-        [s_cmd waitUntilCompleted];
-        if ([s_cmd status] == MTLCommandBufferStatusError) {
+        if (sub_wait(n, SUBW_FLUSH) < 0) {
             s_cmd_errors++;
             if (s_cmd_errors <= 4)
                 fprintf(stderr, LOGP "command buffer error: %s\n",
                         [[[s_cmd error] localizedDescription] UTF8String]);
         }
+        sub_wait_upto(n, SUBW_RING);   /* and every earlier one: the rings are free */
         s_vb_pos = 0;
         s_ib_pos = 0;
     }
@@ -1664,11 +1814,38 @@ static int init(void)
          * per index at most. */
         s_vb_size = 16u << 20;
         s_ib_size = NV_MAX_INDICES * 3u * 4u;
-        s_vb = [s_dev newBufferWithLength:s_vb_size options:MTLResourceStorageModeShared];
-        s_ib = [s_dev newBufferWithLength:s_ib_size options:MTLResourceStorageModeShared];
+        int rings_ok = 1;
+        {
+            /* RECOMP_DEBUG=metal_ring_small=<KB> (test hook): both rings of
+             * both copies at most that size, so draws cut the ring often;
+             * a draw larger than a ring is skipped (it changes the picture) */
+            long kb = recomp_env_int(RENV_METAL_RING_SMALL, 0);
+            int k;
+            if (kb > 0) {
+                NSUInteger b = (NSUInteger)kb << 10;
+                s_ring_small = 1;
+                if (b < s_vb_size)
+                    s_vb_size = b;
+                if (b < s_ib_size)
+                    s_ib_size = b;
+                fprintf(stderr, LOGP "metal_ring_small=%ld: vertex rings %lu B, index rings"
+                        " %lu B\n", kb, (unsigned long)s_vb_size, (unsigned long)s_ib_size);
+            }
+            for (k = 0; k < RING_COPIES; k++) {
+                s_ring[k].vb = [s_dev newBufferWithLength:s_vb_size
+                                                  options:MTLResourceStorageModeShared];
+                s_ring[k].ib = [s_dev newBufferWithLength:s_ib_size
+                                                  options:MTLResourceStorageModeShared];
+                if (!s_ring[k].vb || !s_ring[k].ib)
+                    rings_ok = 0;
+            }
+        }
+        s_ring_cur = 0;
+        s_vb = s_ring[0].vb;
+        s_ib = s_ring[0].ib;
         s_vis = [s_dev newBufferWithLength:VIS_SLOTS * 8u
                                    options:MTLResourceStorageModeShared];
-        if (!s_vb || !s_ib || !s_vis) {
+        if (!rings_ok || !s_vis) {
             fprintf(stderr, LOGP "buffer creation failed\n");
             return 0;
         }
@@ -1945,8 +2122,7 @@ static void stage_write(id<MTLTexture> tex, uint32_t rw, uint32_t rh)
                 toTexture:tex destinationSlice:0 destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
         [b endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        sub_wait(sub_commit(cb), SUBW_STAGE);
     }
     s_stage_writes++;
 }
@@ -2372,22 +2548,60 @@ static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
     return nv2a_vtx_decode(a->type, a->size, p, out);
 }
 
-/* `bytes` from a ring, 16-aligned; on overflow the frame so far is flushed
- * (and waited for) and the ring starts over. NULL if it can never fit. */
-static void *ring_alloc(id<MTLBuffer> b, NSUInteger size, NSUInteger *pos,
-                        NSUInteger bytes, NSUInteger *off)
+/* A whole draw's room in the active ring copy, vertex and index bytes
+ * together, 16-aligned, before anything is written. When either does not
+ * fit, the frame so far is flushed and waited for (flush(1): the pass ends,
+ * and the draw opens the next with Load, colour, depth and stencil kept) and
+ * the active copy starts over; the other copy is not touched. 0 when the
+ * draw can never fit a ring: skipped, counted, logged once. */
+static int ring_reserve(NSUInteger vbytes, NSUInteger ibytes, float **vf, NSUInteger *vb_off,
+                        void **ip, NSUInteger *ib_off)
 {
-    NSUInteger at = (*pos + 15u) & ~(NSUInteger)15u;
-    if (bytes > size)
-        return NULL;
-    if (at + bytes > size) {
-        PT_WHY(PT_RING);
-        flush(1);   /* resets both rings */
-        at = 0;
+    NSUInteger va, ia;
+    if (vbytes > s_vb_size || ibytes > s_ib_size) {
+        if (!s_ring_oversize++)
+            fprintf(stderr, LOGP "a draw of %lu vertex and %lu index bytes exceeds the rings"
+                    " (%lu and %lu): skipped (later ones counted, not logged)\n",
+                    (unsigned long)vbytes, (unsigned long)ibytes,
+                    (unsigned long)s_vb_size, (unsigned long)s_ib_size);
+        return 0;
     }
-    *pos = at + bytes;
-    *off = at;
-    return (uint8_t *)[b contents] + at;
+    if (s_ring_guard) {
+        /* the copy's first write since the flip: whatever read it last is done */
+        s_ring_guard = 0;
+        sub_wait_upto(s_ring[s_ring_cur].last_sub, SUBW_RING);
+    }
+    va = (s_vb_pos + 15u) & ~(NSUInteger)15u;
+    ia = (s_ib_pos + 15u) & ~(NSUInteger)15u;
+    if (va + vbytes > s_vb_size || ia + ibytes > s_ib_size) {
+        PT_WHY(PT_RING);
+        s_ring_cuts++;
+        flush(1);   /* waits everything so far; the active copy's cursors to 0 */
+        va = 0;
+        ia = 0;
+    }
+    s_vb_pos = va + vbytes;
+    s_ib_pos = ia + ibytes;
+    *vb_off = va;
+    *ib_off = ia;
+    *vf = (float *)((uint8_t *)[s_vb contents] + va);
+    *ip = (uint8_t *)[s_ib contents] + ia;
+    return 1;
+}
+
+/* At the flip, after its wait: the other copy becomes the active one, from
+ * its start; its first write waits for its last submission (in serial mode
+ * long done). Then the completions so far are observed. */
+static void ring_switch(void)
+{
+    s_ring_cur = (s_ring_cur + 1) % RING_COPIES;
+    s_vb = s_ring[s_ring_cur].vb;
+    s_ib = s_ring[s_ring_cur].ib;
+    s_vb_pos = 0;
+    s_ib_pos = 0;
+    s_ring_guard = 1;   /* the flip calls it with nothing open: s_ring_bound is 0 */
+    s_ring_switches++;
+    sub_reap();
 }
 
 /* ---- pipelines (blend state is part of them in Metal) ----------------------- */
@@ -4837,22 +5051,12 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             return;
         }
 
-        /* Rings first: an overflow flushes, which ends the open pass. */
+        /* Rings first, the whole draw at once: an overflow flushes, which
+         * ends the open pass. */
         vbytes = (NSUInteger)count * nf4 * 16u;
         if (vbytes < 16)
             vbytes = 16;
-        vf = (float *)ring_alloc(s_vb, s_vb_size, &s_vb_pos, vbytes, &vb_off);
-        {
-            uint64_t fl = s_flushes;
-            ip = vf ? ring_alloc(s_ib, s_ib_size, &s_ib_pos, (NSUInteger)nidx * 4u, &ib_off)
-                    : NULL;
-            if (vf && ip && fl != s_flushes) {
-                /* The index ring overflowed after the vertices were placed,
-                 * and its flush reset the vertex ring: place them again. */
-                vf = (float *)ring_alloc(s_vb, s_vb_size, &s_vb_pos, vbytes, &vb_off);
-            }
-        }
-        if (!vf || !ip) {
+        if (!ring_reserve(vbytes, (NSUInteger)nidx * 4u, &vf, &vb_off, &ip, &ib_off)) {
             s_draws_skipped++;
             return;
         }
@@ -5237,6 +5441,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             [s_enc setBlendColorRed:bf[0] green:bf[1] blue:bf[2] alpha:bf[3]];
         }
         [s_enc setVertexBuffer:s_vb offset:vb_off atIndex:0];
+        s_ring_bound = 1;   /* s_cmd's commit is this copy's last_sub */
         if (d->program) {
             /* c[192] is 3 KB: under setVertexBytes' 4 KB. An encoder keeps
              * its bindings from draw to draw, so while it is the same
@@ -6599,6 +6804,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             PT_WHY(PT_FLIP);
             flush(1);
             occ_settle(1);
+            ring_switch();   /* the frame boundary: the other ring copy */
             prof_add(&s_pa.wait, t);
             if (hdump)
                 host_dump(rt, hcw, hch);
@@ -6697,6 +6903,19 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
                 " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
                 (unsigned long long)s_blits_guest);
+    /* KFC-1720 H1b step 2: submissions, ring copies and waits, running totals */
+    if ((stats_on || s_ring_small) && (s_presents % 300) == 0)
+        fprintf(stderr, LOGP "present #%llu: %llu submissions (%llu errors), %llu ring switches,"
+                " %llu ring cuts, %llu oversize draws; blocked waits: flush %llu (%.1f ms),"
+                " seed %llu (%.1f ms), ring %llu (%.1f ms), table full %llu (%.1f ms)\n",
+                (unsigned long long)s_presents, (unsigned long long)s_sub_last,
+                (unsigned long long)atomic_load_explicit(&s_sub_errs, memory_order_relaxed),
+                (unsigned long long)s_ring_switches, (unsigned long long)s_ring_cuts,
+                (unsigned long long)s_ring_oversize,
+                (unsigned long long)s_subw_blocked[SUBW_FLUSH], s_subw_ns[SUBW_FLUSH] / 1e6,
+                (unsigned long long)s_subw_blocked[SUBW_STAGE], s_subw_ns[SUBW_STAGE] / 1e6,
+                (unsigned long long)s_subw_blocked[SUBW_RING], s_subw_ns[SUBW_RING] / 1e6,
+                (unsigned long long)s_subw_blocked[SUBW_FULL], s_subw_ns[SUBW_FULL] / 1e6);
     if (stats_on && (s_presents % 300) == 0 && s_dof_skipped)
         fprintf(stderr, LOGP "dof_skip: %llu draws skipped\n", (unsigned long long)s_dof_skipped);
     if (periodic && s_rtp)
