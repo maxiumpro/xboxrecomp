@@ -199,11 +199,11 @@ static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
 static int                         s_failed;
 static int                         s_unified;  /* shared textures readable */
 /* RECOMP_DEBUG=metal_rt_private=1 (unified memory only): colour targets in
- * Private storage, every CPU read or write of one through s_stage, a Shared
+ * Private storage, every CPU read or write of one through s_rtp_buf, a Shared
  * buffer grown on demand. s_stage_tex: the texture whose whole hw x hh the
  * staging holds (rt_managed_sync's blit), NULL when none. */
 static int                         s_rtp;
-static id<MTLBuffer>               s_stage;
+static id<MTLBuffer>               s_rtp_buf;
 static size_t                      s_stage_cap;
 static const void                 *s_stage_tex;
 static uint64_t                    s_stage_reads, s_stage_writes;
@@ -2135,17 +2135,17 @@ static id<MTLTexture> rt_texture_new(uint32_t hw, uint32_t hh)
     return [s_dev newTextureWithDescriptor:td];
 }
 
-/* metal_rt_private: s_stage at least `need` bytes. Nothing in flight uses
+/* metal_rt_private: s_rtp_buf at least `need` bytes. Nothing in flight uses
  * the old one: every staging blit is waited for before the next. */
 static int stage_fit(size_t need)
 {
     if (s_stage_cap >= need)
         return 1;
-    [s_stage release];
-    s_stage = [s_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
-    s_stage_cap = s_stage ? need : 0;
+    [s_rtp_buf release];
+    s_rtp_buf = [s_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
+    s_stage_cap = s_rtp_buf ? need : 0;
     s_stage_tex = NULL;
-    return s_stage != nil;
+    return s_rtp_buf != nil;
 }
 
 /* getBytes of rt->tex's region r, rows bpr apart at dst. metal_rt_private:
@@ -2167,23 +2167,23 @@ static void rt_get(const RenderTarget *rt, void *dst, NSUInteger bpr, MTLRegion 
                     " skipped\n", rt->offset);
         return;
     }
-    s = (const uint8_t *)[s_stage contents]
+    s = (const uint8_t *)[s_rtp_buf contents]
         + ((size_t)r.origin.y * rt->hw + r.origin.x) * 4u;
     for (y = 0; y < r.size.height; y++)
         memcpy((uint8_t *)dst + y * bpr, s + y * (size_t)rt->hw * 4u, r.size.width * 4u);
 }
 
-/* metal_rt_private: rt_seed's pixels (rw x rh, tight rows) are in s_stage;
+/* metal_rt_private: rt_seed's pixels (rw x rh, tight rows) are in s_rtp_buf;
  * blit them into tex on a command buffer of its own, committed and waited
  * for now. It is enqueued ahead of the frame's s_cmd (not committed yet), so
  * every pass that uses tex, and rt_grow's later blit of the old contents,
- * runs after it; and s_stage is free again on return. */
+ * runs after it; and s_rtp_buf is free again on return. */
 static void stage_write(id<MTLTexture> tex, uint32_t rw, uint32_t rh)
 {
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-        [b copyFromBuffer:s_stage sourceOffset:0 sourceBytesPerRow:(NSUInteger)rw * 4u
+        [b copyFromBuffer:s_rtp_buf sourceOffset:0 sourceBytesPerRow:(NSUInteger)rw * 4u
               sourceBytesPerImage:(NSUInteger)rw * 4u * rh sourceSize:MTLSizeMake(rw, rh, 1)
                 toTexture:tex destinationSlice:0 destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -2205,12 +2205,12 @@ static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w
         return 0;
     guard_open();   /* our own read of the seed is not a title read */
     if (s_rtp) {
-        /* Private: the same pixels into s_stage, then a blit (stage_write). */
+        /* Private: the same pixels into s_rtp_buf, then a blit (stage_write). */
         uint8_t *st;
         uint32_t y;
         if (!stage_fit((size_t)hw * hh * 4u))
             return 0;
-        st = (uint8_t *)[s_stage contents];
+        st = (uint8_t *)[s_rtp_buf contents];
         s_stage_tex = NULL;   /* it holds the seed now */
         if (hw == w) {
             for (y = 0; y < h; y++)
@@ -5804,11 +5804,11 @@ static void rt_managed_sync(RenderTarget *rt)
     ensure_cmd();
     b = pt_on() ? pt_blit(PT_SYNC, NV2A_GCAT_OTHER) : [s_cmd blitCommandEncoder];
     if (s_rtp) {
-        /* metal_rt_private: the whole texture into s_stage, after every pass
+        /* metal_rt_private: the whole texture into s_rtp_buf, after every pass
          * already encoded; the caller's wait completes it, then rt_get. */
         [b copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0
               sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(rt->hw, rt->hh, 1)
-                  toBuffer:s_stage destinationOffset:0
+                  toBuffer:s_rtp_buf destinationOffset:0
     destinationBytesPerRow:(NSUInteger)rt->hw * 4u
   destinationBytesPerImage:(NSUInteger)rt->hw * 4u * rt->hh];
         [b endEncoding];
