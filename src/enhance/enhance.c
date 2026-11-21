@@ -164,6 +164,7 @@ int xbox_enhance_init(const char *root, const char *title)
     struct nv2a_host_opts o;
     const char *aspect, *shader_lib;
     long long scale, aniso, overscan;
+    long smax;
     int rc, pacing, surface, shader_lines;
     char surface_txt[48], overscan_txt[64] = "", hud_txt[96] = "", shader[512];
 
@@ -171,10 +172,14 @@ int xbox_enhance_init(const char *root, const char *title)
     memset(&o, 0, sizeof o);
 
     scale = enhance_cfg_int("render.scale", 1);
-    if (scale < 1 || scale > SCALE_MAX) {
-        long long c = scale < 1 ? 1 : SCALE_MAX;
-        fprintf(stderr, LOGP "render.scale=%lld out of range 1..%d; using %lld\n",
-                scale, SCALE_MAX, c);
+    /* RECOMP_DEBUG=scale_max=5..8 (KFC-1105): a capacity probe above 4. */
+    smax = recomp_env_int(RENV_SCALE_MAX_DIAG, SCALE_MAX);
+    if (smax < SCALE_MAX || smax > 8)
+        smax = SCALE_MAX;
+    if (scale < 1 || scale > smax) {
+        long long c = scale < 1 ? 1 : smax;
+        fprintf(stderr, LOGP "render.scale=%lld out of range 1..%ld; using %lld\n",
+                scale, smax, c);
         scale = c;
     }
     o.render_scale = (unsigned)scale;
