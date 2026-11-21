@@ -594,6 +594,10 @@ static uint64_t s_gb_cal_ns, s_gb_cal_gpu;   /* a (host ns, GPU tick) pair */
  * fixed 300 flips of metal_gpu_blocks' window (pt_judge), arm A (both off)
  * on even blocks, arm B (as set) on odd ones; 0 off. */
 static int s_nd_mode = -1, s_nd_alt, s_ff_mode, s_ff_alt, s_ab_blk;
+/* RECOMP_DEBUG=metal_ab_null=1 (KFC-1105, the hub's null control): arm B's
+ * combiner fragments are a second, separate compile of the same MSL (key[36]
+ * bit 13, FsEntry.fast bit 1): new functions and pipelines, same shader. */
+static int s_null_mode;
 #define ND_BLOCK 300   /* pt_judge's window */
 
 static void nd_env(void)
@@ -611,6 +615,11 @@ static void nd_env(void)
     s_ff_mode = ff && (!strcasecmp(ff, "alt") || ff[0] == '1');
     s_ff_alt = s_ff_mode && !strcasecmp(ff, "alt");
     s_ab_blk = ab > 0 ? ND_BLOCK : 0;
+    s_null_mode = recomp_env_on(RENV_METAL_AB_NULL) > 0;
+    if (s_null_mode)
+        fprintf(stderr, LOGP "metal_ab_null=1: arm B compiles the same combiner MSL again, as its own functions"
+                " and pipelines (a null control for metal_ab_alt)
+");
     if (nd && !s_nd_mode && nd[0] != '0')
         fprintf(stderr, LOGP "metal_nodiscard=%s: not 1, 2, alt or altneg, off\n", nd);
     if (ff && !s_ff_mode && ff[0] != '0')
@@ -631,7 +640,7 @@ static void nd_env(void)
 static int nd_any(void)
 {
     nd_env();
-    return s_nd_mode || s_ff_mode || s_ab_blk;
+    return s_nd_mode || s_ff_mode || s_ab_blk || s_null_mode;
 }
 
 /* metal_ab_alt: this flip is in arm B (always when metal_ab_alt is off). */
@@ -655,6 +664,13 @@ static int ff_now(void)
 {
     nd_env();
     return s_ff_mode && nd_arm_b() && !(s_ff_alt && (s_presents & 1));
+}
+
+/* metal_ab_null for this flip. */
+static int null_now(void)
+{
+    nd_env();
+    return s_null_mode && nd_arm_b();
 }
 
 /* The passes bookkeeping, for either trace and for metal_depth_dontcare,
@@ -4226,6 +4242,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
         key[36] |= 2048u;
     if (!w && ff_now())
         key[36] |= 4096u;
+    if (null_now())
+        key[36] |= 8192u;   /* metal_ab_null: bit 13, the same text compiled again */
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key)) {
         s_fs_sel_nd = memo.nd;
@@ -4247,6 +4265,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
     st.no_discard = (int)(key[36] >> 11 & 1u); /* RECOMP_DEBUG=metal_nodiscard */
     fast = (int)(key[36] >> 12 & 1u);          /* metal_fs_fastmath: in FsEntry, not st */
+    if (key[36] & 8192u)
+        fast |= 2;                              /* metal_ab_null: its own entry */
     for (n = 0; n < 4; n++) {
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
         st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -4272,11 +4292,12 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
         e->fast = fast;
         e->st = st;
         e->bad = 1;
-        snprintf(what, sizeof what, "combiners %08X%s", hash, fast ? " fast" : "");
+        snprintf(what, sizeof what, "combiners %08X%s%s", hash, (fast & 1) ? " fast" : "",
+                 (fast & 2) ? " null" : "");
         if (d3d8_combiners_generate_msl(&st, msl, (int)sizeof msl) <= 0) {
             s_compile_errors++;
             fprintf(stderr, LOGP "%s: no MSL\n", what);
-        } else if ((e->fn = compile_fn_opts(msl, @"fs_main", what, fast)) != nil) {
+        } else if ((e->fn = compile_fn_opts(msl, @"fs_main", what, fast & 1)) != nil) {
             e->bad = 0;
             s_fs_compiled++;
         }
@@ -4288,7 +4309,7 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     } else {
         memo.fn = e->fn;
         s_fs_sel_nd = st.no_discard;
-        s_fs_sel_fast = e->fast;
+        s_fs_sel_fast = e->fast & 1;
     }
     memo.nd = s_fs_sel_nd;
     memo.fast = s_fs_sel_fast;
