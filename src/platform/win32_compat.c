@@ -1287,6 +1287,11 @@ DWORD SleepEx(DWORD ms, BOOL alertable)
 
 static void *timer_thread(void *arg)
 {
+#if defined(__APPLE__)
+    pthread_setname_np("w32-timerq");
+#else
+    pthread_setname_np(pthread_self(), "w32-timerq");
+#endif
     w32_object *o = (w32_object *)arg;
     int once = (o->timer_period == 0);
 
@@ -1364,6 +1369,11 @@ struct w32_tp_args { PTP_SIMPLE_CALLBACK cb; PVOID ctx; };
 static void *w32_tp_trampoline(void *arg)
 {
     struct w32_tp_args *a = (struct w32_tp_args *)arg;
+#if defined(__APPLE__)
+    pthread_setname_np("w32-tp");
+#else
+    pthread_setname_np(pthread_self(), "w32-tp");
+#endif
     a->cb(NULL, a->ctx);
     free(a);
     return NULL;

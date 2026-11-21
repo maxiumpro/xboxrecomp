@@ -1096,6 +1096,25 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     xbox_InputSetMainPump(1);
     xbox_InputSdlInit(win);
     xbox_log_thread_role("sdl-main", 0);
+#if defined(__APPLE__)
+    {
+        /* Always: ssh and launcher runs differ here, and guest-main copies it. */
+        qos_class_t q = QOS_CLASS_UNSPECIFIED;
+        int rel = 0;
+        const char *nm = "?";
+        if (pthread_get_qos_class_np(pthread_self(), &q, &rel) == 0) {
+            switch ((unsigned)q) {
+            case 0x21: nm = "USER_INTERACTIVE"; break;
+            case 0x19: nm = "USER_INITIATED"; break;
+            case 0x15: nm = "DEFAULT"; break;
+            case 0x11: nm = "UTILITY"; break;
+            case 0x09: nm = "BACKGROUND"; break;
+            case 0x00: nm = "UNSPECIFIED"; break;
+            }
+        }
+        fprintf(stderr, "[THREAD] main qos %s 0x%02x (rel %d)\n", nm, (unsigned)q, rel);
+    }
+#endif
     s_running = 1;
     if (!start_guest()) {
         fprintf(stderr, "[PRESENT] cannot start the guest thread; running headless\n");

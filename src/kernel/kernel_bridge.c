@@ -563,6 +563,40 @@ static void thread_set_os_name(const char *name)
 #endif
 }
 
+#if defined(__APPLE__)
+static const char *qos_name_(unsigned c)
+{
+    switch (c) {
+    case 0x21: return "USER_INTERACTIVE";
+    case 0x19: return "USER_INITIATED";
+    case 0x15: return "DEFAULT";
+    case 0x11: return "UTILITY";
+    case 0x09: return "BACKGROUND";
+    case 0x00: return "UNSPECIFIED";
+    default:   return "?";
+    }
+}
+
+/* RECOMP_DEBUG=qos_ui=1: the hot host threads ask for USER_INTERACTIVE at
+ * their start, whatever class they inherited (a Finder launch and an ssh one
+ * differ). Once per role. */
+static void thread_qos_ui(const char *role, const char *os)
+{
+    static int done_gm, done_ack;
+    int *flag = !strcmp(role, "guest-main") ? &done_gm
+              : !strcmp(role, "nv2a-ack")   ? &done_ack : NULL;
+    unsigned was;
+
+    if (!flag || *flag || !recomp_env_on(RENV_QOS_UI))
+        return;
+    *flag = 1;
+    was = (unsigned)qos_class_self();
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    fprintf(stderr, "[THREAD] qos_ui: %s set USER_INTERACTIVE (was %s 0x%02x)\n",
+            os, qos_name_(was), was);
+}
+#endif
+
 void xbox_log_thread_role(const char *role, uint32_t routine)
 {
     static DWORD main_tid;   /* the thread that logged process-main */
@@ -584,6 +618,9 @@ void xbox_log_thread_role(const char *role, uint32_t routine)
      * process comm, so renaming it to guest-main breaks pgrep and ps. */
     if (GetCurrentThreadId() != main_tid)
         thread_set_os_name(os);
+#if defined(__APPLE__)
+    thread_qos_ui(role, os);
+#endif
     if (routine)
         fprintf(stderr, "[THREAD] tid=%lu role=%s routine=0x%08X\n",
                 (unsigned long)GetCurrentThreadId(), role, routine);

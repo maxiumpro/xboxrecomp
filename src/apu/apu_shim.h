@@ -131,11 +131,43 @@ static inline void qemu_cond_timedwait(QemuCond *c, QemuMutex *m, int ms) {
 typedef void *(*QemuThreadFunc)(void *arg);
 
 #ifndef qemu_thread_create
+#if !defined(_WIN32)
+#include <pthread.h>
+/* POSIX: the name can only be set from the thread itself, so the thread
+ * starts in a trampoline that names it first. */
+struct qemu_thread_boot { void *(*func)(void *); void *arg; char name[16]; };
+static DWORD WINAPI qemu_thread_boot_main(LPVOID p)
+{
+    struct qemu_thread_boot b = *(struct qemu_thread_boot *)p;
+    free(p);
+    if (b.name[0]) {
+#if defined(__APPLE__)
+        pthread_setname_np(b.name);
+#else
+        pthread_setname_np(pthread_self(), b.name);
+#endif
+    }
+    b.func(b.arg);
+    return 0;
+}
+#endif
 static inline void qemu_thread_create(QemuThread *t, const char *name,
                                        void *(*func)(void *), void *arg,
                                        int mode) {
     (void)mode;
+#if !defined(_WIN32)
+    {
+        struct qemu_thread_boot *b = (struct qemu_thread_boot *)malloc(sizeof *b);
+        if (!b) { t->thread = NULL; return; }
+        b->func = func;
+        b->arg = arg;
+        snprintf(b->name, sizeof b->name, "%s", name ? name : "");
+        t->thread = CreateThread(NULL, 0, qemu_thread_boot_main, b, 0, NULL);
+        if (!t->thread) free(b);
+    }
+#else
     t->thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)func, arg, 0, NULL);
+#endif
 #if defined(_WIN32)
     /* Named so the thread can be found from the Linux side under Wine, which
      * passes the description to the task's comm (15 characters there).
@@ -155,8 +187,7 @@ static inline void qemu_thread_create(QemuThread *t, const char *name,
         }
     }
 #else
-    /* POSIX builds reach CreateThread through the compat shim; naming the
-     * thread there (pthread_setname_np) is a TASKS follow-up. */
+    /* POSIX: named by qemu_thread_boot_main, from the thread itself. */
     (void)name;
 #endif
 }

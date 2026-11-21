@@ -5068,6 +5068,11 @@ static DWORD WINAPI raster_worker(LPVOID arg)
 static void *raster_worker(void *arg)
 {
     int k = (int)(intptr_t)arg;
+#if defined(__APPLE__)
+    pthread_setname_np("raster-worker");
+#else
+    pthread_setname_np(pthread_self(), "raster-worker");
+#endif
     unsigned seen = 0;
     pthread_mutex_lock(&s_pool.mu);
     for (;;) {

@@ -339,6 +339,11 @@ static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
 
 static void *apu_trace_reporter(void *unused)
 {
+#if defined(__APPLE__)
+    pthread_setname_np("apu-trace");
+#else
+    pthread_setname_np(pthread_self(), "apu-trace");
+#endif
     uint64_t t0 = s_now_ns(), prev_r = 0, prev_w = 0;
     unsigned k = 0;
     (void)unused;

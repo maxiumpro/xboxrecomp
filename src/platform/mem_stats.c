@@ -396,6 +396,11 @@ static DWORD WINAPI sampler_main(LPVOID arg)
 static void *sampler_main(void *arg)
 {
     (void)arg;
+#if defined(__APPLE__)
+    pthread_setname_np("mem-stats");
+#else
+    pthread_setname_np(pthread_self(), "mem-stats");
+#endif
     for (;;) {
         struct timespec ts = {(time_t)(s_every_ms / 1000), (long)(s_every_ms % 1000) * 1000000L};
         while (nanosleep(&ts, &ts) != 0)
