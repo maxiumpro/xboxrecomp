@@ -618,8 +618,7 @@ static void nd_env(void)
     s_null_mode = recomp_env_on(RENV_METAL_AB_NULL) > 0;
     if (s_null_mode)
         fprintf(stderr, LOGP "metal_ab_null=1: arm B compiles the same combiner MSL again, as its own functions"
-                " and pipelines (a null control for metal_ab_alt)
-");
+                " and pipelines (a null control for metal_ab_alt)\n");
     if (nd && !s_nd_mode && nd[0] != '0')
         fprintf(stderr, LOGP "metal_nodiscard=%s: not 1, 2, alt or altneg, off\n", nd);
     if (ff && !s_ff_mode && ff[0] != '0')
