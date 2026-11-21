@@ -3689,6 +3689,17 @@ static void kernel_guest_time_step(void)
     kernel_guest_time_publish();
 }
 
+#if defined(__APPLE__)
+/* KFC-0110 present queue trace: a stamp per emulated vblank for the Metal
+ * presenter's RECOMP_DEBUG=pace_dump file. Off (flag 0) it costs one load.
+ * The seconds are CLOCK_UPTIME_RAW, the clock CACurrentMediaTime reads. The
+ * writer is the vblank thread; the presenter reads up to head (acquire). */
+#include <time.h>
+double xbox_vblank_ring[512];
+unsigned xbox_vblank_head;
+int xbox_vblank_stamp_on;
+#endif
+
 /* Count one vblank, and once per 600 print the line bench and golden read:
  * should read ~10000 ms. Also the shortest and longest gap between two, by
  * the performance counter rather than the clock the schedule runs on. */
@@ -3702,6 +3713,13 @@ static void kernel_vblank_count(long long now)
 
     kernel_guest_time_step();
     InterlockedIncrement(&g_vblank_total);
+#if defined(__APPLE__)
+    if (__atomic_load_n(&xbox_vblank_stamp_on, __ATOMIC_RELAXED)) {
+        unsigned h = __atomic_load_n(&xbox_vblank_head, __ATOMIC_RELAXED);
+        xbox_vblank_ring[h % 512] = (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+        __atomic_store_n(&xbox_vblank_head, h + 1, __ATOMIC_RELEASE);
+    }
+#endif
     xbox_Nv2aKickNudge();   /* a flip held for this count may go */
     if (!qf.QuadPart)
         QueryPerformanceFrequency(&qf);

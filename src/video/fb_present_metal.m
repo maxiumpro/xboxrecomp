@@ -54,6 +54,7 @@
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/CABase.h>       /* CACurrentMediaTime */
+#import <QuartzCore/CADisplayLink.h> /* pace_dump's display clock (macOS 14) */
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <SDL3/SDL.h>
@@ -78,6 +79,7 @@
 #include "fb_present_metal.h"
 #include "metal_compile.h"
 #include "recomp_env.h"
+#include "recomp_exit_hook.h"
 
 #if __has_feature(objc_arc)
 #error "fb_present_metal.m is manual retain/release: build it without -fobjc-arc"
@@ -254,6 +256,11 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         }
         s_layer.framebufferOnly = shots ? NO : YES;
         s_layer.displaySyncEnabled = vsync ? YES : NO;
+        /* RECOMP_DEBUG=metal_display_sync=0 (KFC-0110): tearing layer, a probe */
+        if (recomp_env_int(RENV_METAL_DISPLAY_SYNC, 1) == 0) {
+            s_layer.displaySyncEnabled = NO;
+            fprintf(stderr, "[PRESENT] metal_display_sync=0: displaySyncEnabled NO\n");
+        }
         /* RECOMP_DEBUG=metal_drawables=2 (KFC-2115, hub 20-nov): a probe of
          * frame age (flip to presented), 2 drawables instead of 3 */
         {
@@ -263,6 +270,12 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
                 fprintf(stderr, "[PRESENT] metal_drawables=2: maximumDrawableCount 2\n");
         }
         s_layer.allowsNextDrawableTimeout = YES;
+        /* The values the layer really holds, after the configuration above. */
+        fprintf(stderr, "[PRESENT] layer: displaySyncEnabled %d presentsWithTransaction %d"
+                " maximumDrawableCount %lu opaque %d framebufferOnly %d\n",
+                (int)s_layer.displaySyncEnabled, (int)s_layer.presentsWithTransaction,
+                (unsigned long)s_layer.maximumDrawableCount, (int)s_layer.opaque,
+                (int)s_layer.framebufferOnly);
         s_internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
         if (s_internal) {
             /* Letterboxed like nv2a_present_rect's fit; fbm_present keeps
@@ -854,6 +867,9 @@ static struct pace_rec {
     double gstart;              /* the completed handler's GPUStartTime */
     double tex;                 /* the flip's slot copy began (0: CPU upload) */
     double wait_in, wait_out;   /* main loop's last SDL wait, entry and exit */
+    double cb;                  /* CACurrentMediaTime() inside the presented handler */
+    uint32_t flip;              /* the guest flip this present shows (pace_dump) */
+    unsigned drw_id;            /* small id of the drawable (pace_dump) */
     int shown_done, gpu_done;   /* atomics: the handlers' release stores */
 } s_pr[PACE_RECS];
 static uint64_t s_pr_head, s_pr_tail;  /* main only: oldest live, next to claim */
@@ -935,16 +951,148 @@ static void pace_print(void)
     memset(&s_pw, 0, offsetof(struct pace_win, iv));
 }
 
+/* RECOMP_DEBUG=pace_dump=path (KFC-0110 present queue trace), with
+ * RECOMP_TRACE=pacing: the file is opened on the first drain and written
+ * only by the main thread. Three kinds of line, all on CACurrentMediaTime's
+ * clock (seconds):
+ *   F  one per drained present record (new, repeat or lost)
+ *   V  one per emulated vblank, stamped by kernel_bridge.c's vblank count
+ *   D  one per CADisplayLink tick (timestamp, targetTimestamp), the
+ *      screen's own clock, independent of the presents (macOS 14 and later)
+ * The drawable id is the drawable's slot in a table of the last 8 distinct
+ * pointers seen (0..7, in order of first sight; a full table reuses slots
+ * round robin): the layer recycles its drawables, so a pointer is a stable
+ * enough name for one. */
+extern double xbox_vblank_ring[512];    /* kernel_bridge.c */
+extern unsigned xbox_vblank_head;
+extern int xbox_vblank_stamp_on;
+
+#define PD_DL_RING 256
+static FILE *s_pd_fp;
+static int s_pd_state;                  /* 0 not tried, 1 open, -1 off */
+static unsigned s_pd_lines;
+static unsigned s_pd_vb_tail;
+static struct { double ts, tts; } s_pd_dl[PD_DL_RING];
+static unsigned s_pd_dl_head, s_pd_dl_tail;     /* main thread only */
+static const void *s_pd_drw[8];
+static unsigned s_pd_drw_n;
+
+@interface KfcPaceLinkTarget : NSObject
+- (void)kfcTick:(CADisplayLink *)link;
+@end
+
+@implementation KfcPaceLinkTarget
+/* Runs on the main thread's run loop. */
+- (void)kfcTick:(CADisplayLink *)link
+{
+    unsigned i = s_pd_dl_head++ % PD_DL_RING;
+    s_pd_dl[i].ts = link.timestamp;
+    s_pd_dl[i].tts = link.targetTimestamp;
+}
+@end
+
+static unsigned pace_drw_id(id<CAMetalDrawable> d)
+{
+    unsigned i;
+    for (i = 0; i < s_pd_drw_n && i < 8; i++)
+        if (s_pd_drw[i] == (const void *)d)
+            return i;
+    i = s_pd_drw_n++ % 8;
+    s_pd_drw[i] = (const void *)d;
+    return i;
+}
+
+static void pace_dump_exit(const char *why)
+{
+    (void)why;
+    if (s_pd_fp)
+        fflush(s_pd_fp);
+}
+
+static void pace_dump_atexit(void)
+{
+    pace_dump_exit(NULL);
+}
+
+static void pace_dump_open(void)
+{
+    const char *path = recomp_env(RENV_PACE_DUMP);
+    s_pd_state = -1;
+    if (!path || !*path)
+        return;
+    s_pd_fp = fopen(path, "w");
+    if (!s_pd_fp) {
+        fprintf(stderr, "[PRESENT] pace_dump: cannot open %s\n", path);
+        return;
+    }
+    s_pd_state = 1;
+    fputs("# kfc pace_dump 1: F seq flip drw_id t_in t_drw t_cmt gstart gend shown cb"
+          " | V t | D ts tts\n", s_pd_fp);
+    recomp_exit_hook_add(pace_dump_exit);
+    atexit(pace_dump_atexit);
+    s_pd_vb_tail = __atomic_load_n(&xbox_vblank_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&xbox_vblank_stamp_on, 1, __ATOMIC_RELEASE);
+    if (@available(macOS 14.0, *)) {
+        KfcPaceLinkTarget *t = [[KfcPaceLinkTarget alloc] init];
+        CADisplayLink *l = nil;
+        if (s_view)
+            l = [(NSView *)s_view displayLinkWithTarget:t selector:@selector(kfcTick:)];
+        else if (NSScreen.mainScreen)
+            l = [NSScreen.mainScreen displayLinkWithTarget:t selector:@selector(kfcTick:)];
+        if (l) {
+            [l retain];     /* the run loop retains it too; never invalidated */
+            [l addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        }
+        /* the link retains its target; t stays ours for the process */
+    }
+    fprintf(stderr, "[PRESENT] pace_dump: writing %s\n", path);
+}
+
+/* The V and D lines gathered since the last drain. Main thread. */
+static void pace_dump_aux(void)
+{
+    unsigned h = __atomic_load_n(&xbox_vblank_head, __ATOMIC_ACQUIRE);
+    if (h - s_pd_vb_tail > 512) {
+        fprintf(s_pd_fp, "V lost %u\n", h - s_pd_vb_tail - 512);
+        s_pd_vb_tail = h - 512;
+    }
+    while (s_pd_vb_tail != h) {
+        fprintf(s_pd_fp, "V %.6f\n", xbox_vblank_ring[s_pd_vb_tail % 512]);
+        s_pd_vb_tail++;
+        s_pd_lines++;
+    }
+    if (s_pd_dl_head - s_pd_dl_tail > PD_DL_RING) {
+        fprintf(s_pd_fp, "D lost %u\n", s_pd_dl_head - s_pd_dl_tail - PD_DL_RING);
+        s_pd_dl_tail = s_pd_dl_head - PD_DL_RING;
+    }
+    while (s_pd_dl_tail != s_pd_dl_head) {
+        unsigned i = s_pd_dl_tail++ % PD_DL_RING;
+        fprintf(s_pd_fp, "D %.6f %.6f\n", s_pd_dl[i].ts, s_pd_dl[i].tts);
+        s_pd_lines++;
+    }
+}
+
 /* The records both handlers are done with, oldest first; a line every 600
  * shown or 10 s. Main thread, after the commit. */
 static void pace_drain(void)
 {
+    if (!s_pd_state)
+        pace_dump_open();
+    if (s_pd_state > 0)
+        pace_dump_aux();
     while (s_pr_head != s_pr_tail) {
         struct pace_rec *r = &s_pr[s_pr_head % PACE_RECS];
         if (!__atomic_load_n(&r->shown_done, __ATOMIC_ACQUIRE)
                 || !__atomic_load_n(&r->gpu_done, __ATOMIC_ACQUIRE))
             break;
         s_pr_head++;
+        if (s_pd_state > 0) {
+            fprintf(s_pd_fp, "F %llu %u %u %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    (unsigned long long)r->seq, (unsigned)r->flip, r->drw_id,
+                    r->t_in, r->t_drw, r->t_cmt, r->gstart, r->gend, r->shown, r->cb);
+            if (++s_pd_lines % 60 == 0)
+                fflush(s_pd_fp);
+        }
         pace_arm();
         s_pw.shown++;
         s_pw.skipped += r->skip;
@@ -1025,7 +1173,9 @@ static struct pace_rec *pace_claim(const struct fbm_pace_frame *pf)
     r->seq = pf->seq;
     r->pub = pf->pub;
     r->skip = skip;
-    r->shown = r->gpu = r->gend = r->gstart = 0;
+    r->shown = r->gpu = r->gend = r->gstart = r->cb = 0;
+    r->flip = 0;
+    r->drw_id = 0;
     r->tex = pf->tex;
     r->wait_in = pf->wait_in;
     r->wait_out = pf->wait_out;
@@ -1040,6 +1190,7 @@ static void pace_handlers(struct pace_rec *r, id<CAMetalDrawable> d, id<MTLComma
 {
     if (@available(macOS 10.15.4, *)) {
         [d addPresentedHandler:^(id<MTLDrawable> dr) {
+            r->cb = CACurrentMediaTime();
             r->shown = [dr presentedTime];
             __atomic_store_n(&r->shown_done, 1, __ATOMIC_RELEASE);
         }];
@@ -1341,6 +1492,8 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         }
         if (pace && (pr = pace_claim(pace))) {
             pr->t_in = t_in;
+            pr->flip = flip;
+            pr->drw_id = pace_drw_id(d);
             pr->t_drw = t_drw;
             pr->t_cmt = CACurrentMediaTime();
             pace_handlers(pr, d, cb);   /* before presentDrawable and the commit */
