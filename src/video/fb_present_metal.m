@@ -1295,6 +1295,13 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 SDL_GetWindowSizeInPixels(win, &ww, &wh);
                 fprintf(stderr, "[PRESENT] drawable %dx%d (window %dx%d px, frame %ux%u%s)\n",
                         dw, dh, ww, wh, (unsigned)fw, (unsigned)fh, internal ? ", internal" : "");
+                {   /* KFC-1105 (Direct or Composited): a Spaces fullscreen or not */
+                    NSWindow *nw = [(NSView *)s_view window];
+                    if (nw)
+                        fprintf(stderr, "[PRESENT] NSWindow: styleMask 0x%lX (NSWindowStyleMaskFullScreen %d),"
+                                " level %ld\n", (unsigned long)nw.styleMask,
+                                (nw.styleMask & NSWindowStyleMaskFullScreen) ? 1 : 0, (long)nw.level);
+                }
                 said_w = dw;
                 said_h = dh;
             }
