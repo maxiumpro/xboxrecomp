@@ -355,10 +355,34 @@ static void maybe_rescan(void)
     uint64_t now = sdl_now_ms();
 
     /* Cleared before the scan, so an event posted during it is not lost. */
-    if (__atomic_exchange_n(&g_rescan, 0, __ATOMIC_ACQ_REL)
-        || now - g_last_scan >= XBOX_INPUT_PROBE_MS) {
+    int ev = __atomic_exchange_n(&g_rescan, 0, __ATOMIC_ACQ_REL);
+    if (ev || now - g_last_scan >= XBOX_INPUT_PROBE_MS) {
+        /* RECOMP_TRACE=pacing: one [INPUT] line per scan, on the window
+         * thread, which presents on macOS (hub 21-nov: a once-a-second probe
+         * on the presenting thread is the pattern of a 0.2 s freeze another
+         * recomp fixed). macOS time is CLOCK_UPTIME_RAW, CACurrentMediaTime's
+         * clock, so it lines up with RECOMP_DEBUG=pace_dump. */
+        static int trace = -1;
+        struct timespec t0, t1;
+#ifdef __APPLE__
+#define XBOX_RESCAN_CLOCK CLOCK_UPTIME_RAW
+#else
+#define XBOX_RESCAN_CLOCK CLOCK_MONOTONIC
+#endif
+        if (trace < 0)
+            trace = recomp_env_on(RENV_PACING_TRACE) > 0;
+        if (trace)
+            clock_gettime(XBOX_RESCAN_CLOCK, &t0);
         g_last_scan = now;
         rescan();
+        if (trace) {
+            clock_gettime(XBOX_RESCAN_CLOCK, &t1);
+            fprintf(stderr, "[INPUT] rescan t=%.6f dur=%.3f ms why=%s\n",
+                    (double)t0.tv_sec + t0.tv_nsec / 1e9,
+                    ((double)(t1.tv_sec - t0.tv_sec) * 1e9
+                     + (double)(t1.tv_nsec - t0.tv_nsec)) / 1e6,
+                    ev ? "event" : "probe");
+        }
     }
 }
 

@@ -7,8 +7,44 @@
 
 #include "d3d8_msl.h"
 
-/* fs_basic's text: SAMPLE is stage 0's sample into t. */
-#define MSL_FS_BASIC(NAME, SAMPLE) \
+/* fs_basic's kills: a CLIPPLANE stage 0, then the alpha test. */
+#define MSL_FS_BASIC_KILLS \
+    "    if (nv2a_clip_kills(pc.clip_mode.x, i.t0)) discard_fragment();\n" \
+    "    if (pc.atest.z != 0u) {\n" \
+    "        float ref = as_type<float>(pc.atest.x);\n" \
+    "        uint a = (uint)(saturate(c.a) * 255.0 + 0.5), r = (uint)(ref * 255.0 + 0.5);\n" \
+    "        bool ok = true;\n" \
+    "        uint f = pc.atest.y;\n" \
+    "        if      (f == 1u) ok = false;\n" \
+    "        else if (f == 2u) ok = a <  r;\n" \
+    "        else if (f == 3u) ok = a == r;\n" \
+    "        else if (f == 4u) ok = a <= r;\n" \
+    "        else if (f == 5u) ok = a >  r;\n" \
+    "        else if (f == 6u) ok = a != r;\n" \
+    "        else if (f == 7u) ok = a >= r;\n" \
+    "        if (!ok) discard_fragment();\n" \
+    "    }\n"
+
+/* Stage 0's sample into t: stock, and render.snap_2d's. */
+#define MSL_FS_BASIC_SAMPLE \
+    "        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[0]);\n" \
+    /* tex_scale.w: the hor+ offset into a padded target, 0 otherwise */ \
+    "        float4 t = tex0.sample(samp0, uv * pc.tex_scale[0].xy" \
+    " + float2(pc.tex_scale[0].w, 0.0), bias(pc.tex_bias.x));\n"
+#define MSL_FS_BASIC_SAMPLE_SNAP \
+    "        float4 g = nv2a_snap_grad(uv, pc.tex_scale[0]) * pc.tex_scale[0].xyxy" \
+    " * exp2(pc.tex_bias.x);\n" \
+    "        uv = nv2a_snap_uv2d(uv, i.pos.xy, pc.tex_scale[0]);\n" \
+    "        uv = uv * pc.tex_scale[0].xy + float2(pc.tex_scale[0].w, 0.0);\n" \
+    "        float4 t;\n" \
+    "        if (pc.tex_scale[0].z < 0.0) t = tex0.sample(samp0, uv, gradient2d(g.xy, g.zw));\n" \
+    "        else t = tex0.sample(samp0, uv, bias(pc.tex_bias.x));\n"
+
+/* fs_basic's text: SAMPLE is stage 0's sample into t; KILLS what may
+ * discard, MSL_FS_BASIC_KILLS or, for RECOMP_DEBUG=metal_nodiscard's
+ * fs_basic_nd, nothing. */
+#define MSL_FS_BASIC(NAME, SAMPLE) MSL_FS_BASIC_K(NAME, SAMPLE, MSL_FS_BASIC_KILLS)
+#define MSL_FS_BASIC_K(NAME, SAMPLE, KILLS) \
     "fragment float4 " NAME "(VOut i [[stage_in]],\n" \
     "                         constant PsConsts &pc [[buffer(0)]],\n" \
     "                         texture2d<float> tex0 [[texture(0)]],\n" \
@@ -24,21 +60,7 @@
     "        if (pc.alpha_only.x == 2u) t.a = 1.0;\n" \
     "        c *= t;\n" \
     "    }\n" \
-    "    if (nv2a_clip_kills(pc.clip_mode.x, i.t0)) discard_fragment();\n" \
-    "    if (pc.atest.z != 0u) {\n" \
-    "        float ref = as_type<float>(pc.atest.x);\n" \
-    "        uint a = (uint)(saturate(c.a) * 255.0 + 0.5), r = (uint)(ref * 255.0 + 0.5);\n" \
-    "        bool ok = true;\n" \
-    "        uint f = pc.atest.y;\n" \
-    "        if      (f == 1u) ok = false;\n" \
-    "        else if (f == 2u) ok = a <  r;\n" \
-    "        else if (f == 3u) ok = a == r;\n" \
-    "        else if (f == 4u) ok = a <= r;\n" \
-    "        else if (f == 5u) ok = a >  r;\n" \
-    "        else if (f == 6u) ok = a != r;\n" \
-    "        else if (f == 7u) ok = a >= r;\n" \
-    "        if (!ok) discard_fragment();\n" \
-    "    }\n" \
+    KILLS \
     "    return c;\n" \
     "}\n"
 
@@ -75,11 +97,7 @@
      * way the CPU compares them). Line for line the D3D11 backend's s_ps_src. */ \
     D3D8_MSL_SNAP_UV \
     D3D8_MSL_CLIP_KILLS \
-    MSL_FS_BASIC("fs_basic", \
-        "        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[0]);\n" \
-        /* tex_scale.w: the hor+ offset into a padded target, 0 otherwise */ \
-        "        float4 t = tex0.sample(samp0, uv * pc.tex_scale[0].xy" \
-        " + float2(pc.tex_scale[0].w, 0.0), bias(pc.tex_bias.x));\n") \
+    MSL_FS_BASIC("fs_basic", MSL_FS_BASIC_SAMPLE) \
     /* A colour clear of part of a target (metal_on_clear): a full-screen \
      * triangle under a scissor, the clear colour as it is. */ \
     "struct ClearV { float4 pos [[position]]; };\n" \
@@ -104,13 +122,25 @@
     D3D8_MSL_SNAP_UV \
     D3D8_MSL_SNAP_2D \
     D3D8_MSL_CLIP_KILLS \
-    MSL_FS_BASIC("fs_basic_snap", \
-        "        float4 g = nv2a_snap_grad(uv, pc.tex_scale[0]) * pc.tex_scale[0].xyxy" \
-        " * exp2(pc.tex_bias.x);\n" \
-        "        uv = nv2a_snap_uv2d(uv, i.pos.xy, pc.tex_scale[0]);\n" \
-        "        uv = uv * pc.tex_scale[0].xy + float2(pc.tex_scale[0].w, 0.0);\n" \
-        "        float4 t;\n" \
-        "        if (pc.tex_scale[0].z < 0.0) t = tex0.sample(samp0, uv, gradient2d(g.xy, g.zw));\n" \
-        "        else t = tex0.sample(samp0, uv, bias(pc.tex_bias.x));\n")
+    MSL_FS_BASIC("fs_basic_snap", MSL_FS_BASIC_SAMPLE_SNAP)
+
+/* RECOMP_DEBUG=metal_nodiscard (KFC-0846): fs_basic and fs_basic_snap
+ * without their kills, each in a library of its own built the first time a
+ * draw takes it, so the stock libraries above keep their text. */
+#define NV2A_MSL_BASIC_ND \
+    "#include <metal_stdlib>\n" \
+    "using namespace metal;\n" \
+    D3D8_MSL_PSCONSTS \
+    D3D8_MSL_VOUT \
+    D3D8_MSL_SNAP_UV \
+    MSL_FS_BASIC_K("fs_basic_nd", MSL_FS_BASIC_SAMPLE, "")
+#define NV2A_MSL_BASIC_SNAP_ND \
+    "#include <metal_stdlib>\n" \
+    "using namespace metal;\n" \
+    D3D8_MSL_PSCONSTS \
+    D3D8_MSL_VOUT \
+    D3D8_MSL_SNAP_UV \
+    D3D8_MSL_SNAP_2D \
+    MSL_FS_BASIC_K("fs_basic_snap_nd", MSL_FS_BASIC_SAMPLE_SNAP, "")
 
 #endif

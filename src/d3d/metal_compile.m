@@ -92,19 +92,53 @@ unsigned metal_compile_pinned_version(void)
     return s_version;
 }
 
-id<MTLLibrary> metal_compile_library(id<MTLDevice> dev, NSString *src,
-                                     const char *what, NSError **err)
+/* RECOMP_DEBUG=metal_fs_fastmath: the shared options with fast math,
+ * made the first time one is asked for, never released. */
+static MTLCompileOptions *s_fast_pinned, *s_fast_os;
+static dispatch_once_t s_fast_once;
+
+static void set_fast(MTLCompileOptions *opts)
+{
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        opts.mathMode = MTLMathModeFast;
+        opts.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsFast;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        opts.fastMathEnabled = YES;
+#pragma clang diagnostic pop
+    }
+}
+
+static void init_fast(void *unused)
+{
+    (void)unused;
+    metal_compile_options();
+    s_fast_pinned = [s_pinned copy];
+    s_fast_os = [s_os copy];
+    set_fast(s_fast_pinned);
+    set_fast(s_fast_os);
+}
+
+MTLCompileOptions *metal_compile_options_fs_fast(void)
+{
+    dispatch_once_f(&s_fast_once, NULL, init_fast);
+    return s_fast_pinned;
+}
+
+static id<MTLLibrary> compile_library(id<MTLDevice> dev, NSString *src, const char *what,
+                                      MTLCompileOptions *pinned, MTLCompileOptions *os,
+                                      NSError **err)
 {
     static atomic_flag said = ATOMIC_FLAG_INIT;
     NSError *e = nil, *e2 = nil;
-    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:metal_compile_options()
-                                             error:&e];
+    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:pinned error:&e];
     if (lib || !s_version) {
         if (err)
             *err = e;
         return lib;
     }
-    lib = [dev newLibraryWithSource:src options:s_os error:&e2];
+    lib = [dev newLibraryWithSource:src options:os error:&e2];
     if (lib && !atomic_flag_test_and_set(&said))
         fprintf(stderr, "[metal] %s failed at MSL %u.%u and compiled at the OS default"
                 " (slower; keep the generators within the pin): %s\n", what,
@@ -113,6 +147,20 @@ id<MTLLibrary> metal_compile_library(id<MTLDevice> dev, NSString *src,
     if (err)
         *err = e;
     return lib;
+}
+
+id<MTLLibrary> metal_compile_library(id<MTLDevice> dev, NSString *src,
+                                     const char *what, NSError **err)
+{
+    MTLCompileOptions *pinned = metal_compile_options();   /* makes s_os */
+    return compile_library(dev, src, what, pinned, s_os, err);
+}
+
+id<MTLLibrary> metal_compile_library_fs_fast(id<MTLDevice> dev, NSString *src,
+                                             const char *what, NSError **err)
+{
+    MTLCompileOptions *pinned = metal_compile_options_fs_fast();   /* makes s_fast_os */
+    return compile_library(dev, src, what, pinned, s_fast_os, err);
 }
 
 #endif

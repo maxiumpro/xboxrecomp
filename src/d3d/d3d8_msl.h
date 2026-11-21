@@ -67,6 +67,10 @@ extern "C" {
 
 #define D3D8_MSL_WDEPTH_END \
     "    if (wkill) discard_fragment();\n" \
+    D3D8_MSL_WDEPTH_OUT
+/* END without the kill: NV2ACombinerState.no_discard (RECOMP_DEBUG=
+ * metal_nodiscard), taken in clamp mode, where wkill is always false. */
+#define D3D8_MSL_WDEPTH_OUT \
     "    FOut o;\n" \
     "    o.c = res;\n" \
     "    o.d = wd.w1.w != 0.0 ? saturate(wd.w1.z / zv - wd.w1.z * wd.w1.x)\n" \

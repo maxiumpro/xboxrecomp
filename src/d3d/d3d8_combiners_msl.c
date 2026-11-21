@@ -446,27 +446,30 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     EMIT("    }\n");
 
     /* ---- CLIPPLANE stages: the coordinate's four plane distances ---- */
-    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+    /* (no_discard, RECOMP_DEBUG=metal_nodiscard: neither these kills nor
+     * the alpha test's nor wkill) */
+    for (i = 0; i < NV2A_MAX_TEXTURES && !state->no_discard; i++)
         if ((int)state->tex_mode[i] == NV2A_TEXMODE_CLIPPLANE)
             EMIT("    if (nv2a_clip_kills(pc.clip_mode[%d], i.t%d)) discard_fragment();\n", i, i);
 
     /* ---- Alpha test: D3DCMP numbering on 8-bit values ---- */
-    EMIT("    if (pc.atest.z != 0u) {\n"
-         "        float ref = as_type<float>(pc.atest.x);\n"
-         "        uint a = (uint)(saturate(res.a) * 255.0 + 0.5), r = (uint)(ref * 255.0 + 0.5);\n"
-         "        bool ok = true;\n"
-         "        uint f = pc.atest.y;\n"
-         "        if      (f == 1u) ok = false;\n"
-         "        else if (f == 2u) ok = a <  r;\n"
-         "        else if (f == 3u) ok = a == r;\n"
-         "        else if (f == 4u) ok = a <= r;\n"
-         "        else if (f == 5u) ok = a >  r;\n"
-         "        else if (f == 6u) ok = a != r;\n"
-         "        else if (f == 7u) ok = a >= r;\n"
-         "        if (!ok) discard_fragment();\n"
-         "    }\n");
+    if (!state->no_discard)
+        EMIT("    if (pc.atest.z != 0u) {\n"
+             "        float ref = as_type<float>(pc.atest.x);\n"
+             "        uint a = (uint)(saturate(res.a) * 255.0 + 0.5), r = (uint)(ref * 255.0 + 0.5);\n"
+             "        bool ok = true;\n"
+             "        uint f = pc.atest.y;\n"
+             "        if      (f == 1u) ok = false;\n"
+             "        else if (f == 2u) ok = a <  r;\n"
+             "        else if (f == 3u) ok = a == r;\n"
+             "        else if (f == 4u) ok = a <= r;\n"
+             "        else if (f == 5u) ok = a >  r;\n"
+             "        else if (f == 6u) ok = a != r;\n"
+             "        else if (f == 7u) ok = a >= r;\n"
+             "        if (!ok) discard_fragment();\n"
+             "    }\n");
     if (state->w_depth)
-        EMIT("%s", D3D8_MSL_WDEPTH_END);
+        EMIT("%s", state->no_discard ? D3D8_MSL_WDEPTH_OUT : D3D8_MSL_WDEPTH_END);
     else
         EMIT("    return res;\n");
     EMIT("}\n");

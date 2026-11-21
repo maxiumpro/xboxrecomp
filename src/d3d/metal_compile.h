@@ -41,5 +41,15 @@ unsigned metal_compile_pinned_version(void);
 id<MTLLibrary> metal_compile_library(id<MTLDevice> dev, NSString *src,
                                      const char *what, NSError **err);
 
+/* RECOMP_DEBUG=metal_fs_fastmath (KFC-0846): the shared options with fast
+ * math (macOS 15: math mode fast and fast functions; older: fastMathEnabled),
+ * the language version the same. Only for the combiners' fragment libraries;
+ * vertex programs and the base library stay safe. Owned here. */
+MTLCompileOptions *metal_compile_options_fs_fast(void);
+
+/* metal_compile_library with those options, the same fallback. */
+id<MTLLibrary> metal_compile_library_fs_fast(id<MTLDevice> dev, NSString *src,
+                                             const char *what, NSError **err);
+
 #endif
 #endif

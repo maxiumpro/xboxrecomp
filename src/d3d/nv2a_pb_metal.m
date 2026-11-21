@@ -186,6 +186,10 @@ static const int s_vtx_attr[VTX_F4] = {0, 3, 4, 9, 10, 11, 12};
  * fs_basic_snap, built when it first draws (fs_basic): nv2a_basic_msl.h. */
 static const char s_msl[] = NV2A_MSL_BASIC;
 static const char s_msl_snap[] = NV2A_MSL_BASIC_SNAP;
+/* RECOMP_DEBUG=metal_nodiscard: fs_basic_nd and fs_basic_snap_nd, built on
+ * first use (fs_basic_pick). */
+static const char s_msl_nd[] = NV2A_MSL_BASIC_ND;
+static const char s_msl_snap_nd[] = NV2A_MSL_BASIC_SNAP_ND;
 
 /* ---- device ---------------------------------------------------------------- */
 
@@ -520,12 +524,24 @@ typedef struct {
     uint64_t sv, ev, sf, ef;    /* vertex, fragment (compute or blit: sf, ef) */
     uint64_t excl;
 } PtPass;
+/* RECOMP_DEBUG=metal_nodiscard / metal_fs_fastmath (KFC-0846): a frame's
+ * draws (encoded); those that could take the variant without discard, and
+ * of them the ones that can gain from hidden-surface removal (no blending,
+ * no depth from the fragment: win, in either arm); those that took it, and
+ * of them the ones that cannot gain (blended; the W variant's depth; both
+ * if both); the draws with a fast-math function; the pipelines pipeline()
+ * built. */
+typedef struct {
+    uint64_t draws, elig, taken, win, blend, fdepth, fast, pso;
+} NdCount;
 typedef struct {
     uint64_t flip;
     int      n, over;           /* passes kept, and passes past PT_MAX */
     int      nk[PTK_N];         /* encoders made, by kind */
     int      gb_n;              /* timestamp slots used */
     PtPass   p[PT_MAX];
+    NdCount  nd;                /* metal_nodiscard's counts */
+    int      nd_arm_b;          /* metal_ab_alt: the frame drew in arm B */
 } PtFrame;
 static PtFrame s_ptf[2];        /* by flip parity: this frame and the one being judged */
 static int      s_pt_cur = -1;  /* the open render pass's index */
@@ -551,6 +567,9 @@ static struct {
     uint64_t fh_draws;               /* metal_flat_half: draws scissored */
     uint64_t cpu_n;                  /* metal_gpu_blocks: frames with a scene pass, */
     double   cpu_sum_ms, cpu_max_ms; /* its close to the flip's commit */
+    NdCount  nd;                     /* metal_nodiscard: the frames' counts */
+    uint64_t late_ticks;             /* metal_gpu_blocks' busy, the block's flips 31 on */
+    int      arm_a, arm_b;           /* metal_ab_alt: frames by arm */
 } s_pts;
 static int  s_pt_on = -1, s_pt_log;
 static int  s_pt_track;         /* readers kept: metal_passes, or metal_depth_dontcare's guess */
@@ -566,6 +585,78 @@ static id   s_gb_sb[2];         /* id<MTLCounterSampleBuffer> by flip parity */
 static id   s_gb_cmd[2];        /* the last command buffer sampled into each */
 static uint64_t s_gb_cal_ns, s_gb_cal_gpu;   /* a (host ns, GPU tick) pair */
 
+/* RECOMP_DEBUG=metal_nodiscard, metal_fs_fastmath and metal_ab_alt
+ * (KFC-0846), read once. s_nd_mode: 0 off, 1 the draws that cannot kill
+ * take the fragment function without discard_fragment (nd_decide), 2 every
+ * draw does (the negative control). s_ff_mode: 1 the combiners' fragment
+ * libraries compile with fast math (not the W variant). *_alt: only on even
+ * flips, as metal_depth_dontcare=alt. s_ab_blk: metal_ab_alt's block, the
+ * fixed 300 flips of metal_gpu_blocks' window (pt_judge), arm A (both off)
+ * on even blocks, arm B (as set) on odd ones; 0 off. */
+static int s_nd_mode = -1, s_nd_alt, s_ff_mode, s_ff_alt, s_ab_blk;
+#define ND_BLOCK 300   /* pt_judge's window */
+
+static void nd_env(void)
+{
+    const char *nd, *ff;
+    long ab;
+    if (s_nd_mode >= 0)
+        return;
+    nd = recomp_env(RENV_METAL_NODISCARD);
+    ff = recomp_env(RENV_METAL_FS_FASTMATH);
+    ab = recomp_env_int(RENV_METAL_AB_ALT, 0);
+    s_nd_mode = !nd ? 0 : !strcasecmp(nd, "alt") ? 1 : !strcasecmp(nd, "altneg") ? 2
+              : nd[0] == '1' ? 1 : nd[0] == '2' ? 2 : 0;
+    s_nd_alt = nd && s_nd_mode && !strncasecmp(nd, "alt", 3);
+    s_ff_mode = ff && (!strcasecmp(ff, "alt") || ff[0] == '1');
+    s_ff_alt = s_ff_mode && !strcasecmp(ff, "alt");
+    s_ab_blk = ab > 0 ? ND_BLOCK : 0;
+    if (nd && !s_nd_mode && nd[0] != '0')
+        fprintf(stderr, LOGP "metal_nodiscard=%s: not 1, 2, alt or altneg, off\n", nd);
+    if (ff && !s_ff_mode && ff[0] != '0')
+        fprintf(stderr, LOGP "metal_fs_fastmath=%s: not 1 or alt, off\n", ff);
+    if (ab > 0 && ab != ND_BLOCK)
+        fprintf(stderr, LOGP "metal_ab_alt=%ld: blocks of %d flips, metal_gpu_blocks' fixed"
+                " window\n", ab, ND_BLOCK);
+    if (s_nd_mode || s_ff_mode || s_ab_blk)
+        fprintf(stderr, LOGP "KFC-0846: metal_nodiscard %s%s, metal_fs_fastmath %s%s;"
+                " metal_ab_alt %s\n",
+                s_nd_mode == 2 ? "2 (negative control: every draw)" : s_nd_mode ? "1" : "off",
+                s_nd_alt ? " (alt: even flips only)" : "", s_ff_mode ? "1" : "off",
+                s_ff_alt ? " (alt: even flips only)" : "",
+                s_ab_blk ? "on: arm A (both off) on flips 0-299, arm B 300-599, ..." : "off");
+}
+
+/* Any of the three is set: pt_on, and the counts' line, follow. */
+static int nd_any(void)
+{
+    nd_env();
+    return s_nd_mode || s_ff_mode || s_ab_blk;
+}
+
+/* metal_ab_alt: this flip is in arm B (always when metal_ab_alt is off). */
+static int nd_arm_b(void)
+{
+    nd_env();
+    return !s_ab_blk || (int)((s_presents / (uint64_t)s_ab_blk) & 1u);
+}
+
+/* metal_nodiscard for this flip: 0, 1 or 2. */
+static int nd_now(void)
+{
+    nd_env();
+    if (!s_nd_mode || !nd_arm_b() || (s_nd_alt && (s_presents & 1)))
+        return 0;
+    return s_nd_mode;
+}
+
+/* metal_fs_fastmath for this flip. */
+static int ff_now(void)
+{
+    nd_env();
+    return s_ff_mode && nd_arm_b() && !(s_ff_alt && (s_presents & 1));
+}
+
 /* The passes bookkeeping, for either trace and for metal_depth_dontcare,
  * which guesses from it (pt_dc_guess). */
 static int pt_on(void)
@@ -577,7 +668,8 @@ static int pt_on(void)
         s_pt_track = s_pt_log || s_dc_mode;
         const char *fh = recomp_env(RENV_METAL_FLAT_HALF);
         s_fh_mode = !fh ? 0 : !strcasecmp(fh, "alt") ? 2 : fh[0] == '1' ? 1 : 0;
-        s_pt_on = s_pt_track || s_fh_mode || recomp_env(RENV_METAL_GPU_BLOCKS) != NULL;
+        s_pt_on = s_pt_track || s_fh_mode || recomp_env(RENV_METAL_GPU_BLOCKS) != NULL
+               || nd_any();   /* metal_nodiscard's counts, by judged frame */
         s_pt_at = s_pt_log ? recomp_env_int(RENV_METAL_PASSES_AT, -1) : -1;
         if (dc && !s_dc_mode)
             fprintf(stderr, LOGP "metal_depth_dontcare=%s: not 1 or alt, off\n", dc);
@@ -1387,7 +1479,28 @@ static void pt_judge(PtFrame *f)
         }
         s_ptw[i--] = s_ptw[--s_ptw_n];
     }
-    gb_resolve(f);
+    {   /* metal_nodiscard's line: the busy time of the block's flips 31 on */
+        uint64_t b0 = 0, b1 = 0;
+        for (k = 0; k < NV2A_GCAT_N; k++)
+            b0 += s_pts.cat_ticks[k];
+        gb_resolve(f);
+        for (k = 0; k < NV2A_GCAT_N; k++)
+            b1 += s_pts.cat_ticks[k];
+        if (s_pts.flips >= 30)
+            s_pts.late_ticks += b1 - b0;
+    }
+    s_pts.nd.draws += f->nd.draws;
+    s_pts.nd.elig += f->nd.elig;
+    s_pts.nd.taken += f->nd.taken;
+    s_pts.nd.win += f->nd.win;
+    s_pts.nd.blend += f->nd.blend;
+    s_pts.nd.fdepth += f->nd.fdepth;
+    s_pts.nd.fast += f->nd.fast;
+    s_pts.nd.pso += f->nd.pso;
+    if (f->nd_arm_b)
+        s_pts.arm_b++;
+    else
+        s_pts.arm_a++;
     for (k = 0; k < PTK_N; k++) {
         s_pts.nk[k] += (uint64_t)f->nk[k];
         if (f->nk[k] > s_pts.maxk[k])
@@ -1421,9 +1534,16 @@ static void pt_judge(PtFrame *f)
     if (++s_pts.flips < 300)
         return;
     {
-        double n = (double)s_pts.flips;
-        char line[1024];
+        double n = (double)s_pts.flips, gscale = 0;
+        char line[1024], arm[48] = "";
         size_t at = 0;
+        /* metal_ab_alt: the block's arm, at the end of its lines */
+        if (nd_any() && s_ab_blk) {
+            if (s_pts.arm_a && s_pts.arm_b)
+                snprintf(arm, sizeof arm, " arm mixed (A %d, B %d)", s_pts.arm_a, s_pts.arm_b);
+            else
+                snprintf(arm, sizeof arm, " arm %s", s_pts.arm_b ? "B" : "A");
+        }
         if (s_pt_log) {
             fprintf(stderr, LOGP "passes over %d flips: render %.2f/frame (max %d), render-aux"
                     " %.2f (max %d), compute %.2f (max %d), blit %.2f (max %d); %.2f render"
@@ -1456,6 +1576,7 @@ static void pt_judge(PtFrame *f)
         }
         if (s_gb_on > 0) {
             double r = gb_window(), sum = 0, scale = r > 0 ? r : 1.0;
+            gscale = scale;
             at = 0;
             line[0] = 0;
             for (k = 0; k < NV2A_GCAT_N; k++) {
@@ -1472,13 +1593,31 @@ static void pt_judge(PtFrame *f)
                     " passes %.3f of it), %.3f idle in a %.3f span from the first sample to the"
                     " last; command buffers %.3f, busy - buffers %+.3f; %s %.3f ns/tick; %llu"
                     " passes timed, untimed: %llu with no draw, %llu with only stale samples,"
-                    " %llu without timestamps\n", s_pts.flips, line, sum,
+                    " %llu without timestamps%s\n", s_pts.flips, line, sum,
                     s_pts.mixed_ticks * scale / n / 1e6, s_pts.idle_ticks * scale / n / 1e6,
                     s_pts.span_ticks * scale / n / 1e6, s_pts.cmd_ns / n / 1e6,
                     sum - s_pts.cmd_ns / n / 1e6, r > 0 ? "calibrated" : "UNCALIBRATED, taken as",
                     scale, (unsigned long long)s_pts.gb_passes,
                     (unsigned long long)s_pts.gb_nodraw, (unsigned long long)s_pts.gb_stale,
-                    (unsigned long long)s_pts.gb_missing);
+                    (unsigned long long)s_pts.gb_missing, arm);
+        }
+        /* metal_nodiscard (KFC-0846): the block's draws, and its busy time
+         * without its first 30 flips (new pipelines after an arm change) */
+        if (s_gb_on > 0 || nd_any()) {
+            char late[64] = " no GPU time (metal_gpu_blocks off)";
+            if (s_gb_on > 0 && s_pts.flips > 30)
+                snprintf(late, sizeof late, " %.3f busy over flips 31-%d (ms/frame)",
+                         s_pts.late_ticks * gscale / (double)(s_pts.flips - 30) / 1e6,
+                         s_pts.flips);
+            fprintf(stderr, LOGP "nodiscard over %d flips: %llu draws, %llu eligible (%llu of"
+                    " them can gain: opaque, no depth from the fragment), %llu took no discard"
+                    " (%llu blended, %llu with depth from the fragment), %llu with fast math;"
+                    " %llu pipelines built;%s%s\n", s_pts.flips,
+                    (unsigned long long)s_pts.nd.draws, (unsigned long long)s_pts.nd.elig,
+                    (unsigned long long)s_pts.nd.win, (unsigned long long)s_pts.nd.taken,
+                    (unsigned long long)s_pts.nd.blend, (unsigned long long)s_pts.nd.fdepth,
+                    (unsigned long long)s_pts.nd.fast, (unsigned long long)s_pts.nd.pso,
+                    late, arm);
         }
         if (s_gb_on > 0 && s_pts.cpu_n)
             fprintf(stderr, LOGP "cpu after scene over %d flips: mean %.3f ms, max %.3f ms (scene"
@@ -1508,6 +1647,8 @@ static void pt_flip(void)
     f->flip = s_presents;
     f->n = f->over = f->gb_n = 0;
     memset(f->nk, 0, sizeof f->nk);
+    memset(&f->nd, 0, sizeof f->nd);
+    f->nd_arm_b = s_ab_blk && nd_arm_b();   /* metal_ab_alt: this frame's arm */
     s_pt_cur = -1;
     s_pt_aux = -1;
     s_pt_last.valid = 0;
@@ -2897,6 +3038,8 @@ static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> f
         ns = prof_now() - t0;
         s_sh_flip.pso_ns += ns;
         s_sh_flip.pso++;
+        if (s_pt_on > 0)
+            s_ptf[s_presents & 1].nd.pso++;   /* metal_nodiscard's line */
         if (sh_trace())
             fprintf(stderr, LOGP "shader: pipeline %.2f ms (blend %u, depth %u), flip %llu\n",
                     ns / 1e6, key[0], key[5], (unsigned long long)s_presents);
@@ -3714,7 +3857,10 @@ static NSString *sh_nonce_rename(NSString *text, NSString **name)
     return text;
 }
 
-static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *what)
+/* fast: RECOMP_DEBUG=metal_fs_fastmath's options (metal_compile_library_fs_fast),
+ * for a combiners' fragment library only; compile_fn is safe. */
+static id<MTLFunction> compile_fn_opts(const char *src, NSString *name, const char *what,
+                                       int fast)
 {
     const char *dump;
     NSError *err = nil;
@@ -3748,7 +3894,8 @@ static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *w
     }
     text = sh_nonce_rename(text, &name);
     t0 = prof_now();
-    lib = metal_compile_library(s_dev, text, what, &err);
+    lib = fast ? metal_compile_library_fs_fast(s_dev, text, what, &err)
+               : metal_compile_library(s_dev, text, what, &err);
     ns = prof_now() - t0;
     s_sh_flip.lib_ns += ns;
     s_sh_flip.lib++;
@@ -3771,6 +3918,11 @@ static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *w
         pl_note_library(fn, what, [orig UTF8String], src);   /* as generated */
     }
     return fn;
+}
+
+static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *what)
+{
+    return compile_fn_opts(src, name, what, 0);
 }
 
 #define VS_MAX 512
@@ -3839,6 +3991,7 @@ static VsEntry *vs_cache(void)
 typedef struct {
     uint32_t          hash;
     int               bad;
+    int               fast;   /* metal_fs_fastmath: built with fast math */
     NV2ACombinerState st;
     id<MTLFunction>   fn;
 } FsEntry;
@@ -3871,6 +4024,67 @@ static id<MTLFunction> fs_basic(void)
         fn = compile_fn(s_msl_snap, @"fs_basic_snap", "fs_basic_snap");
     }
     return fn ? fn : s_fs_basic;
+}
+
+/* RECOMP_DEBUG=metal_nodiscard (KFC-0846), nd_decide's per-draw choice:
+ * s_fs_nd, the batch takes the functions without discard; s_fs_nd_elig,
+ * none of its kills could fire (counted). fs_select sets s_fs_sel_nd and
+ * s_fs_sel_fast to what the function it returned is. s_fs_basic_nd:
+ * fs_basic_nd and fs_basic_snap_nd, built the first time one is asked for
+ * (nil until then, or when it cannot be built). */
+static int s_fs_nd, s_fs_nd_elig, s_fs_sel_nd, s_fs_sel_fast;
+static id<MTLFunction> s_fs_basic_nd[2];
+
+/* fs_basic(), or with s_fs_nd its variant without the kills (fs_basic()
+ * when that cannot be built). Sets s_fs_sel_nd and s_fs_sel_fast. */
+static id<MTLFunction> fs_basic_pick(void)
+{
+    static int tried[2];
+    int snap;
+
+    s_fs_sel_nd = 0;
+    s_fs_sel_fast = 0;
+    if (!s_fs_nd)
+        return fs_basic();
+    snap = nv2a_snap_2d_on(nv2a_host_render_scale()) ? 1 : 0;
+    if (!tried[snap]) {
+        tried[snap] = 1;
+        s_fs_basic_nd[snap] = snap ? compile_fn(s_msl_snap_nd, @"fs_basic_snap_nd",
+                                                "fs_basic_snap_nd")
+                                   : compile_fn(s_msl_nd, @"fs_basic_nd", "fs_basic_nd");
+    }
+    if (!s_fs_basic_nd[snap])
+        return fs_basic();
+    s_fs_sel_nd = 1;
+    return s_fs_basic_nd[snap];
+}
+
+/* fn is one of the functions for a batch without combiners. */
+static int fs_is_basic(id<MTLFunction> fn)
+{
+    return fn == s_fs_basic || fn == fs_basic()
+        || (s_fs_basic_nd[0] && fn == s_fs_basic_nd[0])
+        || (s_fs_basic_nd[1] && fn == s_fs_basic_nd[1]);
+}
+
+/* The batch's metal_nodiscard choice, before fs_select: eligible when no
+ * kill of its fragment function can fire, exactly: the alpha test off or
+ * ALWAYS (D3DCMP 8, which leaves ok true), no CLIPPLANE stage (every
+ * clip_mode 0, so nv2a_clip_kills is false), and for the combiners' W
+ * variant (w with combiners) the clamp mode, where wkill is false
+ * (nv2a_wdepth_consts_fill: w1.y is 1 only for cull). No path here sets
+ * alpha to coverage. =2 takes the variant on every draw. */
+static void nd_decide(const struct nv2a_pb_vsh *v, const struct nv2a_ps_consts *pc, int w)
+{
+    int nd = nd_now(), k;
+
+    s_fs_nd_elig = !pc->alpha_test_enable || pc->alpha_func == 8u;
+    for (k = 0; k < 4; k++)
+        if (pc->clip_mode[k])
+            s_fs_nd_elig = 0;
+    if (w && v->rc_set && (v->rc_ctl & 0xFF) && ((v->zminmax_ctl >> 4) & 0xFu) == 0u)
+        s_fs_nd_elig = 0;
+    s_fs_nd = nd == 2 || (nd == 1 && s_fs_nd_elig);
 }
 
 /* fs_select returned the combiners' function: only that one declares
@@ -3947,23 +4161,42 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w);
 static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, int w)
 {
     id<MTLFunction> fn = fs_select_body(v, w);
-    s_fs_comb = fn != s_fs_basic && fn != fs_basic();
+    s_fs_comb = !fs_is_basic(fn);
     s_fs_w = w && s_fs_comb;
     return fn;
+}
+
+/* metal_nodiscard's counts for an encoded draw (pt_judge's line): blend,
+ * the pipeline blends. */
+static void nd_count(int blend)
+{
+    NdCount *c = &s_ptf[s_presents & 1].nd;
+
+    c->draws++;
+    c->elig += (uint64_t)(s_fs_nd_elig != 0);
+    c->win += (uint64_t)(s_fs_nd_elig && !blend && !s_fs_w);   /* the ceiling, either arm */
+    c->fast += (uint64_t)(s_fs_sel_fast != 0);
+    if (!s_fs_sel_nd)
+        return;
+    c->taken++;
+    if (blend)
+        c->blend++;
+    if (s_fs_w)
+        c->fdepth++;
 }
 
 static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
 {
     static char msl[65536];
-    static struct { int valid; uint32_t r[38]; id<MTLFunction> fn; } memo;
+    static struct { int valid, nd, fast; uint32_t r[38]; id<MTLFunction> fn; } memo;
     NV2ACombinerState st;
     uint32_t key[38], modes = 0, inputs = 0, hash;
     FsEntry *e = NULL;
     char what[32];
-    int n;
+    int n, fast;
 
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
-        return fs_basic();
+        return fs_basic_pick();
     nv2a_ps_stage_key(s_stage, v->other_stage_input, v->dot_rgbmapping, &modes, &inputs);
     memcpy(key, v->rc_cicw, 32);
     memcpy(key + 8, v->rc_aicw, 32);
@@ -3986,9 +4219,19 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
             | (snap_lazy_now() ? 32u : 0u);   /* RECOMP_DEBUG=metal_snap_lazy */
     if ((key[36] & 1u) && snap_lazy_now() == 2)   /* V2: bit 10, the stages in 6..9 */
         key[36] |= 1024u | (s_snap_mask & 15u) << 6;
+    /* RECOMP_DEBUG=metal_nodiscard (KFC-0846): bit 11, no discard_fragment
+     * (nd_decide); metal_fs_fastmath: bit 12, fast math, not for the W
+     * variant, whose depth comes from the fragment */
+    if (s_fs_nd)
+        key[36] |= 2048u;
+    if (!w && ff_now())
+        key[36] |= 4096u;
     key[37] = inputs;
-    if (memo.valid && !memcmp(memo.r, key, sizeof key))
+    if (memo.valid && !memcmp(memo.r, key, sizeof key)) {
+        s_fs_sel_nd = memo.nd;
+        s_fs_sel_fast = memo.fast;
         return memo.fn;
+    }
 
     memset(&st, 0, sizeof st);
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
@@ -4002,39 +4245,53 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
     st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
     st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
+    st.no_discard = (int)(key[36] >> 11 & 1u); /* RECOMP_DEBUG=metal_nodiscard */
+    fast = (int)(key[36] >> 12 & 1u);          /* metal_fs_fastmath: in FsEntry, not st */
     for (n = 0; n < 4; n++) {
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
         st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
         st.tex_cube[n] = (int)((inputs >> (28 + n)) & 1u);
     }
     st.bump_on = 1;
-    hash = fnv(&st, sizeof st);
+    /* no_discard is last: while it is 0 the hash (each "combiners %08X"
+     * name) is the one before it was added */
+    hash = fnv(&st, st.no_discard ? sizeof st : offsetof(NV2ACombinerState, no_discard));
     if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
-        return fs_basic();
+        return fs_basic_pick();
     for (n = 0; n < s_fs_n; n++)
-        if (s_fs[n].hash == hash && !memcmp(&s_fs[n].st, &st, sizeof st)) {
+        if (s_fs[n].hash == hash && s_fs[n].fast == fast
+                && !memcmp(&s_fs[n].st, &st, sizeof st)) {
             e = &s_fs[n];
             break;
         }
     if (!e) {
         if (s_fs_n == FS_MAX)
-            return fs_basic();
+            return fs_basic_pick();
         e = &s_fs[s_fs_n++];
         e->hash = hash;
+        e->fast = fast;
         e->st = st;
         e->bad = 1;
-        snprintf(what, sizeof what, "combiners %08X", hash);
+        snprintf(what, sizeof what, "combiners %08X%s", hash, fast ? " fast" : "");
         if (d3d8_combiners_generate_msl(&st, msl, (int)sizeof msl) <= 0) {
             s_compile_errors++;
             fprintf(stderr, LOGP "%s: no MSL\n", what);
-        } else if ((e->fn = compile_fn(msl, @"fs_main", what)) != nil) {
+        } else if ((e->fn = compile_fn_opts(msl, @"fs_main", what, fast)) != nil) {
             e->bad = 0;
             s_fs_compiled++;
         }
     }
     memcpy(memo.r, key, sizeof key);
     memo.valid = 1;
-    memo.fn = e->bad ? fs_basic() : e->fn;   /* as D3D11: the basic PS */
+    if (e->bad) {
+        memo.fn = fs_basic_pick();   /* as D3D11: the basic PS */
+    } else {
+        memo.fn = e->fn;
+        s_fs_sel_nd = st.no_discard;
+        s_fs_sel_fast = e->fast;
+    }
+    memo.nd = s_fs_sel_nd;
+    memo.fast = s_fs_sel_fast;
     return memo.fn;
 }
 
@@ -5206,6 +5463,9 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         wz_ez = v->depth_enable && dt_earlyz_peek(rt->w, rt->h);
         wz_fast = wz_ez && w_on && nv2a_w_earlyz_fast(v, d->prim);
         s_snap_mask = snap_mask(&mpc.b);   /* metal_snap_lazy=2; final below */
+        /* RECOMP_DEBUG=metal_nodiscard: the batch's one choice, which the
+         * second fs_select below keeps */
+        nd_decide(v, &mpc.b, w_on && !wz_fast);
         ffn = fs_select(v, w_on && !wz_fast);
         /* spec_ctl.w: 1 the W variant writes the depth; 2 the vertex z is
          * E, on the fast path or for a W batch on such a buffer whose W
@@ -5531,12 +5791,16 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
          * failure) keeps the first function, whose extra calls on the
          * render-target stages are no-ops. */
         if (snap_lazy_now() == 2 && s_fs_comb && snap_mask(&mpc.b) != s_snap_mask) {
-            int comb = s_fs_comb, fw = s_fs_w;
+            int comb = s_fs_comb, fw = s_fs_w, snd = s_fs_sel_nd, sff = s_fs_sel_fast;
             id<MTLFunction> fn;
             s_snap_mask = snap_mask(&mpc.b);
             fn = fs_select(v, w_on && !wz_fast);
-            if (s_fs_comb)
+            if (s_fs_comb) {
                 ffn = fn;
+            } else {   /* the first function stays, and what it is */
+                s_fs_sel_nd = snd;
+                s_fs_sel_fast = sff;
+            }
             s_fs_comb = comb;
             s_fs_w = fw;
         }
@@ -5545,6 +5809,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             s_draws_skipped++;
             return;
         }
+        if (s_pt_on > 0)
+            nd_count(g->blend_enable != 0);   /* metal_nodiscard's line */
         [s_enc setRenderPipelineState:pso];
         if (s_enc_dt) {
             id<MTLDepthStencilState> dss = use_z ? depth_state(v->depth_enable, use_s, wz_ez)

@@ -327,6 +327,14 @@ typedef struct NV2ACombinerState {
      * flag, set only under the trace, so the stock shader text is unchanged;
      * in the cache key. 3D, cube, bump and dot stages are not measured. */
     int tex_mag;
+
+    /* 1: RECOMP_DEBUG=metal_nodiscard (KFC-0846), MSL only: no
+     * discard_fragment, neither the CLIPPLANE stages' nor the alpha test's
+     * nor, with w_depth, wkill's; the caller sets it only where none could
+     * kill (or for the negative control). A backend flag, 0 otherwise, so
+     * the stock shader text is unchanged; in the cache key. Keep it last:
+     * the Metal backend hashes the state before it while it is 0. */
+    int no_discard;
 } NV2ACombinerState;
 
 /**
