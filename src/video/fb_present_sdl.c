@@ -118,6 +118,7 @@ struct fb_slot {
      * publish count and the publish time on fbm_now's clock. */
     uint64_t seq;
     double   pub;
+    double   tex;                  /* fbm_now at the start of the slot copy; 0 on the CPU path */
 };
 
 static struct fb_slot  s_slot[3];
@@ -135,6 +136,8 @@ static int             s_layer;
 /* Layer mode with RECOMP_TRACE=pacing: publish stamps its slot and the
  * presenter reports what reached the screen. Set once before the guest. */
 static int             s_pace;
+/* Main thread, pacing trace: entry and exit of the last SDL_WaitEventTimeout. */
+static double          s_wait_in, s_wait_out;
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -347,6 +350,8 @@ void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h, unsigned n, uint
     s_slot[s_back].h = h;
     s_slot[s_back].n = n;
     s_slot[s_back].pad = pad;
+    if (s_pace)
+        s_slot[s_back].tex = fbm_now();
     return t;
 #else
     (void)w;
@@ -1156,7 +1161,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* One event loop for the window and the controllers: SDL_PumpEvents
          * (inside the wait) also updates the game controllers, which
          * xinput_device.c then only reads. */
-        if (SDL_WaitEventTimeout(&ev, 100)) {
+        int got_ev;
+#if defined(__APPLE__)
+        if (s_pace)
+            s_wait_in = fbm_now();
+#endif
+        got_ev = SDL_WaitEventTimeout(&ev, 100);
+#if defined(__APPLE__)
+        if (s_pace)
+            s_wait_out = fbm_now();
+#endif
+        if (got_ev) {
             do {
                 /* Keys and the mouse for port 0, and the window events
                  * that release them; both only read the event. */
@@ -1310,7 +1325,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             const struct nv2a_ovl_list *const *ls = NULL;
             int nls = 0;
 #endif
-            struct fbm_pace_frame pf = { shown_seq ? f->seq : 0, f->pub };
+            struct fbm_pace_frame pf = { shown_seq ? f->seq : 0, f->pub, f->tex,
+                                       s_wait_in, s_wait_out };
             if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             if (fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,

@@ -22,6 +22,9 @@ int   fbm_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pit
 struct fbm_pace_frame {
     uint64_t seq;
     double   pub;
+    double   tex;       /* entry to the slot copy (0: CPU upload path) */
+    double   wait_in;   /* main loop's last SDL_WaitEventTimeout: entry */
+    double   wait_out;  /* ... and exit, before this pickup */
 };
 /* CACurrentMediaTime(): seconds on the host clock presentedTime is in
  * (mach_absolute_time's, which stops while the machine sleeps). Any thread. */

@@ -833,10 +833,15 @@ double fbm_now(void)
  * presentedTime. The GPU time is the whole present command buffer's
  * (GPUEndTime - GPUStartTime): MetalFX, the shader chain and a shot blit
  * included when they run. The age split (KFC-2115, hub 20-nov), p50/p95 of
- * each new image's age in five parts on the same clock: pickup, publish to
- * fbm_present's entry (the SDL main loop's turn); drawable, nextDrawable's
- * wait; encode, to the commit; gpu, the commit to the present pass's
- * GPUEndTime; display, GPUEndTime to presentedTime. */
+ * each new image's age in nine parts on the same clock: publish to
+ * fbm_present's entry is busy (work the main loop already had when the
+ * frame was published), sdl (its SDL_WaitEventTimeout wait and event
+ * delivery) and loop (this turn's work before fbm_present); drawable,
+ * nextDrawable's wait; encode, to the commit; queue, the commit to the GPU
+ * start; gpu, the present pass's GPUStartTime to GPUEndTime; display,
+ * GPUEndTime to presentedTime (refresh wait and system queue mixed, not
+ * attributed). copy, the flip's blit into the slot up to the publish, is
+ * outside the age (which starts at the publish) and shown for reference. */
 #define PACE_RECS 64
 #define PACE_SAMPLES 4096
 static struct pace_rec {
@@ -846,6 +851,9 @@ static struct pace_rec {
     double gpu;                 /* the completed handler's */
     double t_in, t_drw, t_cmt;  /* fbm_present's entry, nextDrawable back, commit */
     double gend;                /* the completed handler's GPUEndTime */
+    double gstart;              /* the completed handler's GPUStartTime */
+    double tex;                 /* the flip's slot copy began (0: CPU upload) */
+    double wait_in, wait_out;   /* main loop's last SDL wait, entry and exit */
     int shown_done, gpu_done;   /* atomics: the handlers' release stores */
 } s_pr[PACE_RECS];
 static uint64_t s_pr_head, s_pr_tail;  /* main only: oldest live, next to claim */
@@ -858,7 +866,7 @@ static struct pace_win {        /* main only: the line being gathered */
     uint64_t skipped;
     unsigned ni, na, ng, nq;
     float iv[PACE_SAMPLES], age[PACE_SAMPLES], gpu[PACE_SAMPLES];
-    float split[5][PACE_SAMPLES];   /* nq each: the age split */
+    float split[9][PACE_SAMPLES];   /* nq each: the age split */
 } s_pw;
 
 static int pace_cmp(const void *a, const void *b)
@@ -912,9 +920,10 @@ static void pace_print(void)
     if (s_pw.untracked)
         fprintf(stderr, " untracked %u", s_pw.untracked);
     if (s_pw.nq) {
-        static const char *const nm[5] = { "pickup", "drawable", "encode", "gpu", "display" };
+        static const char *const nm[9] = { "copy", "busy", "sdl", "loop", "drawable",
+                                           "encode", "queue", "gpu", "display" };
         fprintf(stderr, " \xc2\xb7 age split p50/p95 ms:");
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < 9; i++) {
             qsort(s_pw.split[i], s_pw.nq, sizeof s_pw.split[i][0], pace_cmp);
             fprintf(stderr, " %s %s/%s", nm[i],
                     pace_pct(s_pw.split[i], s_pw.nq, 0.50, 1, a, sizeof a),
@@ -947,11 +956,37 @@ static void pace_drain(void)
             s_pw.fresh++;
             if (s_pw.na < PACE_SAMPLES)
                 s_pw.age[s_pw.na++] = (float)((r->shown - r->pub) * 1e3);
-            if (r->gend > 0 && s_pw.nq < PACE_SAMPLES) {
-                double t[6] = { r->pub, r->t_in, r->t_drw, r->t_cmt, r->gend, r->shown };
+            if (r->gend > 0 && r->gstart > 0 && s_pw.nq < PACE_SAMPLES) {
+                /* pub to t_in in three parts, by where the main loop was */
+                double wi = r->wait_in, wo = r->wait_out;
+                double busy, sdl, loop;
+                float *sp[9];
                 int i;
-                for (i = 0; i < 5; i++)
-                    s_pw.split[i][s_pw.nq] = (float)((t[i + 1] - t[i]) * 1e3);
+                if (wo <= 0 || wo <= r->pub) {
+                    busy = 0;
+                    sdl = 0;
+                    loop = r->t_in - r->pub;
+                } else if (wi <= r->pub) {
+                    busy = 0;
+                    sdl = wo - r->pub;
+                    loop = r->t_in - wo;
+                } else {
+                    busy = wi - r->pub;
+                    sdl = wo - wi;
+                    loop = r->t_in - wo;
+                }
+                for (i = 0; i < 9; i++)
+                    sp[i] = &s_pw.split[i][s_pw.nq];
+                /* Negatives are kept as they are: they flag crossed clocks. */
+                *sp[0] = r->tex > 0 ? (float)((r->pub - r->tex) * 1e3) : 0.0f;
+                *sp[1] = (float)(busy * 1e3);
+                *sp[2] = (float)(sdl * 1e3);
+                *sp[3] = (float)(loop * 1e3);
+                *sp[4] = (float)((r->t_drw - r->t_in) * 1e3);
+                *sp[5] = (float)((r->t_cmt - r->t_drw) * 1e3);
+                *sp[6] = (float)((r->gstart - r->t_cmt) * 1e3);
+                *sp[7] = (float)((r->gend - r->gstart) * 1e3);
+                *sp[8] = (float)((r->shown - r->gend) * 1e3);
                 s_pw.nq++;
             }
             if (s_pc_last_new > 0 && s_pw.ni < PACE_SAMPLES)
@@ -990,7 +1025,10 @@ static struct pace_rec *pace_claim(const struct fbm_pace_frame *pf)
     r->seq = pf->seq;
     r->pub = pf->pub;
     r->skip = skip;
-    r->shown = r->gpu = r->gend = 0;
+    r->shown = r->gpu = r->gend = r->gstart = 0;
+    r->tex = pf->tex;
+    r->wait_in = pf->wait_in;
+    r->wait_out = pf->wait_out;
     __atomic_store_n(&r->shown_done, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&r->gpu_done, 0, __ATOMIC_RELAXED);
     return r;
@@ -1012,6 +1050,7 @@ static void pace_handlers(struct pace_rec *r, id<CAMetalDrawable> d, id<MTLComma
         CFTimeInterval a = [c GPUStartTime], b = [c GPUEndTime];
         r->gpu = b > a ? b - a : 0;
         r->gend = b;
+        r->gstart = a;
         __atomic_store_n(&r->gpu_done, 1, __ATOMIC_RELEASE);
     }];
 }
