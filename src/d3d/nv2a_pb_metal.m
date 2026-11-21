@@ -207,6 +207,27 @@ static id<MTLBuffer>               s_rtp_buf;
 static size_t                      s_stage_cap;
 static const void                 *s_stage_tex;
 static uint64_t                    s_stage_reads, s_stage_writes;
+/* CPU writes into memory the GPU uses (KFC-1720 H1b step 3b). Each waits
+ * for the allocation's last GPU use (cpu_write_wait), not for the frame:
+ *  - s_rtp_buf: rt_managed_sync's staging copy writes it, stage_write's blit
+ *    reads it; rt_seed fills it.
+ *  - s_dbg_vb (enhancements' debug draws): dbg_present fills it every flip,
+ *    the draw after reads it.
+ *  - a presenter slot: a guest-bytes or readback frame is uploaded into the
+ *    back slot (fbm_upload's replaceRegion), which waits there only for the
+ *    presenter's own pass over it; s_win_blit_sub, the newest copy of a
+ *    frame into a slot (layer mode), is waited for before the hand-off.
+ * *_pend: the open s_cmd uses it; *_sub: the newest submission that did,
+ * numbered when flush commits it, 0 none. Covered elsewhere: the vertex and
+ * index rings (step 2, ring copies), the visibility slots and the tex_mag
+ * buffers (step 3a, by the submission that writes them). Every other CPU
+ * write into a texture, the texture cache's uploads (tex_make,
+ * tex_make_cube: a changed texture gets a new MTLTexture), the 1x1 fallbacks
+ * and rt_seed's replaceRegion, goes into a texture made just before it:
+ * nothing to wait for. Constants go by setVertexBytes / setFragmentBytes,
+ * copied at encode time. */
+static int                         s_rtp_pend, s_dbg_vb_pend;
+static uint64_t                    s_rtp_sub, s_dbg_vb_sub, s_win_blit_sub;
 static int                         s_bc;       /* BC1 and BC3 textures sample (pack entries) */
 
 /* Vertex and index rings, reset after every wait (flip or overflow). Two
@@ -302,6 +323,15 @@ typedef struct {
      * ended in Error (sub_observe). */
     int            wpend, spend, wbad;
     uint64_t       last_write_sub, sync_sub;
+    /* The newest submission that used tex at all (KFC-1720 H1b step 3b): a
+     * write or sync copy above, or a read: a draw sampling it, a 2D blit or
+     * the self copy from it, the flip's copy into the presenter's back slot.
+     * upend: the open s_cmd has such a read (rt_read_mark), numbered when
+     * flush commits it. A CPU write into tex would wait for it (cpu_write_wait);
+     * none does today: every CPU write of a target's texels (rt_seed) goes
+     * into a texture made just before it, which no submission has used. */
+    int            upend;
+    uint64_t       use_sub;
 } RenderTarget;
 
 /* The order of colour and depth writes, for a depth surface sampled as a
@@ -1535,9 +1565,12 @@ static uint64_t s_sub_floor;    /* every number up to this one is observed */
 static _Atomic uint64_t s_sub_errs;   /* ended in Error, counted by the handler */
 /* Why a sub_wait blocked: a flush(1)'s own wait (the serial flip's), the
  * seed blit's, a ring copy's reuse, a full table, a GET_REPORT in
- * RECOMP_METAL_OCC=sync (step 3a), a CPU read of a render target's bytes or
- * of the tex_mag trace (step 3a). */
-enum { SUBW_FLUSH, SUBW_STAGE, SUBW_RING, SUBW_FULL, SUBW_REPORT, SUBW_READ, SUBW_N };
+ * RECOMP_METAL_OCC=sync (step 3a), a CPU read of a render target's bytes
+ * (step 3a); CPU writes (step 3b): rt_seed's fill of s_rtp_buf, the debug
+ * draws' s_dbg_vb, a frame uploaded into a presenter slot, the tex_mag
+ * trace's read and zeroing of a frame's buffer. */
+enum { SUBW_FLUSH, SUBW_STAGE, SUBW_RING, SUBW_FULL, SUBW_REPORT, SUBW_READ,
+       SUBW_RTP, SUBW_DBG, SUBW_SLOT, SUBW_MAG, SUBW_N };
 static uint64_t s_subw_blocked[SUBW_N], s_subw_ns[SUBW_N];
 static uint64_t s_rb_skipped;   /* CPU reads skipped: the write's submission ended in Error */
 
@@ -1696,10 +1729,16 @@ static void flush(int wait)
     }
     /* What this command buffer writes for the CPU to read takes its number
      * (KFC-1720 H1b step 3a): the targets it draws or copies into, their
-     * sync blits, the visibility slots it counts into, the tex_mag frame. */
+     * sync blits, the visibility slots it counts into, the tex_mag frame.
+     * And what it uses that the CPU rewrites (step 3b): any target it reads
+     * or writes, s_rtp_buf, s_dbg_vb. */
     {
         int i;
         for (i = 0; i < RT_MAX; i++) {
+            if (s_rt[i].wpend || s_rt[i].spend || s_rt[i].upend) {
+                s_rt[i].use_sub = n;
+                s_rt[i].upend = 0;
+            }
             if (s_rt[i].wpend) {
                 s_rt[i].last_write_sub = n;
                 s_rt[i].wpend = 0;
@@ -1710,6 +1749,14 @@ static void flush(int wait)
                 s_rt[i].spend = 0;
             }
         }
+    }
+    if (s_rtp_pend) {
+        s_rtp_sub = n;
+        s_rtp_pend = 0;
+    }
+    if (s_dbg_vb_pend) {
+        s_dbg_vb_sub = n;
+        s_dbg_vb_pend = 0;
     }
     occ_committed(n);
     mag_committed(n);
@@ -1745,6 +1792,30 @@ static void ensure_cmd(void)
 {
     if (!s_cmd)
         s_cmd = [[s_queue commandBuffer] retain];
+}
+
+/* Before a CPU write into memory the GPU uses (KFC-1720 H1b step 3b): when
+ * the open s_cmd uses it (*pend), s_cmd is committed first (`pt` tags its
+ * pass end, metal_passes), which numbers *sub; then every submission up to
+ * *sub, its last use, is waited for, not the frame. Up to, not only *sub:
+ * earlier ones may have used it too, and two reads are not ordered against
+ * each other. A wait that blocks is counted under `why`. */
+static void cpu_write_wait(const int *pend, const uint64_t *sub, int pt, int why)
+{
+    if (*pend) {
+        PT_WHY(pt);
+        flush(0);
+    }
+    sub_wait_upto(*sub, why);
+}
+
+/* A GPU read of rt's texture encoded in s_cmd (use_sub). Only the targets
+ * in s_rt: the self copy and the depth views rt_texture also serves are not
+ * numbered. */
+static void rt_read_mark(RenderTarget *rt)
+{
+    if (rt >= s_rt && rt < s_rt + RT_MAX)
+        rt->upend = 1;
 }
 
 /* Open a pass on rt: with `clear`, loadAction Clear to c; else Load. The
@@ -2141,10 +2212,12 @@ static int stage_fit(size_t need)
 {
     if (s_stage_cap >= need)
         return 1;
-    [s_rtp_buf release];
+    [s_rtp_buf release];   /* a command buffer using it keeps its own reference */
     s_rtp_buf = [s_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
     s_stage_cap = s_rtp_buf ? need : 0;
     s_stage_tex = NULL;
+    s_rtp_pend = 0;   /* a new buffer: no submission uses it */
+    s_rtp_sub = 0;
     return s_rtp_buf != nil;
 }
 
@@ -2188,14 +2261,17 @@ static void stage_write(id<MTLTexture> tex, uint32_t rw, uint32_t rh)
                 toTexture:tex destinationSlice:0 destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
         [b endEncoding];
-        sub_wait(sub_commit(cb), SUBW_STAGE);
+        s_rtp_sub = sub_commit(cb);   /* it reads s_rtp_buf (step 3b) */
+        sub_wait(s_rtp_sub, SUBW_STAGE);
     }
     s_stage_writes++;
 }
 
 /* tex (w x h guest, hw x hh host) from the guest's bytes at addr when the
  * surface is 32-bit, as the CPU path draws over whatever memory holds; 0 when
- * it is not (the texture is left as made). */
+ * it is not (the texture is left as made). tex is always one rt_texture_new
+ * made just before (surface, rt_grow): no submission has used it, so its
+ * replaceRegion waits for nothing; s_rtp_buf may be in use (step 3b). */
 static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w,
                     uint32_t h, uint32_t pad, uint32_t hw, uint32_t hh)
 {
@@ -2210,6 +2286,8 @@ static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w
         uint32_t y;
         if (!stage_fit((size_t)hw * hh * 4u))
             return 0;
+        /* A staging copy may still be writing it: its submission first. */
+        cpu_write_wait(&s_rtp_pend, &s_rtp_sub, PT_SYNC, SUBW_RTP);
         st = (uint8_t *)[s_rtp_buf contents];
         s_stage_tex = NULL;   /* it holds the seed now */
         if (hw == w) {
@@ -3478,7 +3556,7 @@ static void mag_flip(void)
         if (s_mag[k].sub && sub_done_upto(s_mag[k].sub))
             mag_fold_frame(k);
     if (s_mag[next].sub) {
-        sub_wait_upto(s_mag[next].sub, SUBW_READ);
+        sub_wait_upto(s_mag[next].sub, SUBW_MAG);   /* the CPU reads, then zeroes it */
         mag_fold_frame(next);
     }
     /* An empty frame stays current; one no submission drew into is too. */
@@ -4783,6 +4861,7 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
         }
         [b copyFromTexture:self->tex toTexture:s_self.tex];
         [b endEncoding];
+        rt_read_mark(self);
     }
     s_self.offset = self->offset;
     s_self.pad = self->pad;
@@ -5257,6 +5336,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     stage_from_cache(k);
                 } else if ((src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
+                    rt_read_mark(src);   /* sampled: a GPU read (use_sub) */
                     nv2a_ps_consts_rt(&mpc.b, k, t, src->w, src->h);
                     if (nv2a_rt_no_alpha(nv2a_tex_linear_twin(t->color)))
                         mpc.b.alpha_only[k] = 2;
@@ -5815,6 +5895,7 @@ static void rt_managed_sync(RenderTarget *rt)
         s_stage_tex = (const void *)rt->tex;
         s_stage_reads++;
         rt->spend = 1;   /* the CPU's copy: rt_read_ready waits for it too */
+        s_rtp_pend = 1;  /* it writes s_rtp_buf: rt_seed's fill waits for it */
         return;
     }
 #pragma clang diagnostic push
@@ -6778,12 +6859,16 @@ static void dbg_present(RenderTarget *rt)
         size_t c = s_dbg_vb_cap ? s_dbg_vb_cap : 65536;
         while (c < (size_t)at * stride)
             c *= 2;
-        [s_dbg_vb release];
+        [s_dbg_vb release];   /* a command buffer using it keeps its own reference */
         s_dbg_vb = [s_dev newBufferWithLength:c options:MTLResourceStorageModeShared];
         s_dbg_vb_cap = s_dbg_vb ? c : 0;
+        s_dbg_vb_pend = 0;   /* a new buffer: no submission uses it */
+        s_dbg_vb_sub = 0;
         if (!s_dbg_vb)
             return;
     }
+    /* The last flip's draw may still read it (KFC-1720 H1b step 3b). */
+    cpu_write_wait(&s_dbg_vb_pend, &s_dbg_vb_sub, PT_DEBUG, SUBW_DBG);
     for (s = 0; s < NV2A_DBG_SEGS; s++)
         if (l->n[s])
             memcpy((uint8_t *)[s_dbg_vb contents] + (size_t)first[s] * stride, l->v[s],
@@ -6800,6 +6885,7 @@ static void dbg_present(RenderTarget *rt)
         [s_enc setViewport:vp];
         [s_enc setCullMode:MTLCullModeNone];
         [s_enc setVertexBuffer:s_dbg_vb offset:0 atIndex:0];
+        s_dbg_vb_pend = 1;
         [s_enc setVertexBytes:&xs length:sizeof xs atIndex:1];
     }
     for (s = 0; s < NV2A_DBG_SEGS; s++) {
@@ -7020,7 +7106,13 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                              toTexture:slot destinationSlice:0 destinationLevel:0
                      destinationOrigin:MTLOriginMake(0, 0, 0)];
                     [b endEncoding];
+                    /* KFC-1720 H1b step 3b: the copy reads rt (use_sub; a
+                     * later pass that writes rt is on this queue after it,
+                     * ordered by tracked hazards), and writes the slot, which
+                     * a later CPU upload into a slot waits for (s_win_blit_sub). */
+                    rt_read_mark(rt);
                     flush(0);
+                    s_win_blit_sub = s_sub_last;   /* flush(0)'s commit of the copy */
                     xbox_FramebufferWindowPublishTexture();
                     s_window_presents++;
                 }
@@ -7110,14 +7202,19 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
      * flips. Sync report waits: RECOMP_METAL_OCC=sync's blocked waits on a
      * report's own submissions; settle waits: settles that spun for results
      * within occ_settle_us; settled: answered before the result landed (the
-     * address's last count), amended: the late result written over it after. */
+     * address's last count), amended: the late result written over it after.
+     * Step 3b: the blocked waits of CPU writes, by site (cpu_write_wait, the
+     * slot hand-off, mag_flip); texture uploads never wait (new textures). */
     if ((stats_on || s_ring_small) && (s_presents % 300) == 0) {
         static uint64_t p_rep, p_rep_ns, p_rd, p_rd_ns, p_skip, p_sw, p_sw_us, p_set, p_am,
-                        p_late, p_bad;
+                        p_late, p_bad, p_rtp, p_rtp_ns, p_dbg, p_dbg_ns, p_slot, p_slot_ns,
+                        p_mag, p_mag_ns;
         fprintf(stderr, LOGP "present #%llu, last 300 flips: visibility: sync report waits"
                 " %llu (%.1f ms), settle waits %llu (%.1f ms), settled before the result %llu,"
                 " amended late %llu, late as visible %llu, error results %llu; readback waits"
-                " %llu (%.1f ms), readbacks skipped on error %llu\n",
+                " %llu (%.1f ms), readbacks skipped on error %llu; CPU-write waits: staging"
+                " fill %llu (%.1f ms), debug draws %llu (%.1f ms), slot upload %llu (%.1f ms),"
+                " tex_mag %llu (%.1f ms)\n",
                 (unsigned long long)s_presents,
                 (unsigned long long)(s_subw_blocked[SUBW_REPORT] - p_rep),
                 (s_subw_ns[SUBW_REPORT] - p_rep_ns) / 1e6,
@@ -7129,9 +7226,21 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)(s_occ_bad - p_bad),
                 (unsigned long long)(s_subw_blocked[SUBW_READ] - p_rd),
                 (s_subw_ns[SUBW_READ] - p_rd_ns) / 1e6,
-                (unsigned long long)(s_rb_skipped - p_skip));
+                (unsigned long long)(s_rb_skipped - p_skip),
+                (unsigned long long)(s_subw_blocked[SUBW_RTP] - p_rtp),
+                (s_subw_ns[SUBW_RTP] - p_rtp_ns) / 1e6,
+                (unsigned long long)(s_subw_blocked[SUBW_DBG] - p_dbg),
+                (s_subw_ns[SUBW_DBG] - p_dbg_ns) / 1e6,
+                (unsigned long long)(s_subw_blocked[SUBW_SLOT] - p_slot),
+                (s_subw_ns[SUBW_SLOT] - p_slot_ns) / 1e6,
+                (unsigned long long)(s_subw_blocked[SUBW_MAG] - p_mag),
+                (s_subw_ns[SUBW_MAG] - p_mag_ns) / 1e6);
         p_rep = s_subw_blocked[SUBW_REPORT]; p_rep_ns = s_subw_ns[SUBW_REPORT];
         p_rd = s_subw_blocked[SUBW_READ]; p_rd_ns = s_subw_ns[SUBW_READ];
+        p_rtp = s_subw_blocked[SUBW_RTP]; p_rtp_ns = s_subw_ns[SUBW_RTP];
+        p_dbg = s_subw_blocked[SUBW_DBG]; p_dbg_ns = s_subw_ns[SUBW_DBG];
+        p_slot = s_subw_blocked[SUBW_SLOT]; p_slot_ns = s_subw_ns[SUBW_SLOT];
+        p_mag = s_subw_blocked[SUBW_MAG]; p_mag_ns = s_subw_ns[SUBW_MAG];
         p_skip = s_rb_skipped; p_sw = s_occ_settle_waits; p_sw_us = s_occ.settle_wait_us;
         p_set = s_occ.settled; p_am = s_occ.amended; p_late = s_occ.late; p_bad = s_occ_bad;
     }
@@ -7156,6 +7265,11 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
      * SDL_UpdateTexture. It reads the texture, not the guest bytes. A surface
      * the backend never drew (guest bytes) goes as the CPU path presents it,
      * in either mode. */
+    /* With the layer, the hand-offs below upload into the presenter's back
+     * slot (fbm_upload, a CPU write), which waits there only for the
+     * presenter's own pass over it: the copies of earlier frames into slots
+     * come first (KFC-1720 H1b step 3b). 0: none ever, nothing to wait for. */
+    sub_wait_upto(s_win_blit_sub, SUBW_SLOT);
     if (rt && win && rb_bad) {
         /* No readback (rt_read_ready): not the guest bytes either, which
          * are an older frame; the window shows what it has. */
@@ -7394,6 +7508,7 @@ static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
     dst->last_use = s_tick;
     dst->dirty = 1;   /* the copy is on the GPU only: an eviction writes it back */
     dst->wpend = 1;   /* s_cmd's number is its last write */
+    rt_read_mark(src);
     dst->zseq = ++s_zseq;
     dt_mem_written(dst->addr, dst->pitch * dst->h, dst->zseq);   /* zt_find */
     dst->copy = 1;
