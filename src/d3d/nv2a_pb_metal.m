@@ -6358,7 +6358,7 @@ static const char s_spin_msl[] =
 
 static void gpu_spin_flip(void)
 {
-    static int mode = -1;   /* 0 off, 1 every flip, 2 alt */
+    static int mode = -1;   /* 0 off, 1 every flip, 2 alt, 3 auto: while fullscreen */
     static double target_us = 4000.0;
     static uint32_t iters = 1u << 16;
     static id<MTLCommandQueue> q;
@@ -6373,7 +6373,11 @@ static void gpu_spin_flip(void)
         const char *e = recomp_env(RENV_METAL_GPU_SPIN);
         long v = e ? strtol(e, NULL, 10) : 0;
         int off = e && ((e[0] == '0' && !v) || !strcasecmp(e, "off"));
-        mode = !e || off ? 0 : !strcasecmp(e, "alt") ? 2 : v == 1 || v >= 100 ? 1 : 0;
+        /* Default auto (hub, KFC-1650, 20-nov: 13.5 -> 9.8 ms of frame GPU
+         * time and 60 FPS at scale 4 on an M4 Air): spin while the window is
+         * fullscreen (present.fullscreen, live), a provisional fix until the
+         * flip stops waiting (KFC-1720). 0/off: never. */
+        mode = !e ? 3 : off ? 0 : !strcasecmp(e, "alt") ? 2 : v == 1 || v >= 100 ? 1 : 0;
         if (v >= 100)
             target_us = (double)v;
         if (e && !mode && !off)
@@ -6393,13 +6397,14 @@ static void gpu_spin_flip(void)
                                          options:MTLResourceStorageModePrivate];
             }
             if (!pso || !q || !out) {
-                fprintf(stderr, LOGP "metal_gpu_spin=%s: no spin kernel (%s), off\n", e,
+                fprintf(stderr, LOGP "metal_gpu_spin=%s: no spin kernel (%s), off\n", e ? e : "auto",
                         err ? [[err localizedDescription] UTF8String] : "?");
                 mode = 0;
             } else {
                 fprintf(stderr, LOGP "metal_gpu_spin=%s: after each flip's wait a %u-thread"
-                        " spin on its own queue, target %.0f us of GPU time%s\n", e,
-                        SPIN_THREADS, target_us, mode == 2 ? " (alt: before even flips only)" : "");
+                        " spin on its own queue, target %.0f us of GPU time%s\n", e ? e : "auto",
+                        SPIN_THREADS, target_us, mode == 2 ? " (alt: before even flips only)"
+                        : mode == 3 ? " (while fullscreen)" : "");
             }
         }
     }
@@ -6432,6 +6437,8 @@ static void gpu_spin_flip(void)
         last = nil;
     }
     if (mode == 2 && ((s_presents + 1) & 1))   /* the frame built next is odd */
+        return;
+    if (mode == 3 && !nv2a_host_opts()->fullscreen)
         return;
     cb = [q commandBuffer];
     ce = [cb computeCommandEncoder];
