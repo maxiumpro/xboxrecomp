@@ -114,6 +114,10 @@ struct fb_slot {
      * display.overscan's crop (1 and 0 for an uploaded guest-size frame). */
     unsigned n;
     uint32_t pad;
+    /* RECOMP_TRACE=pacing, layer mode (fbm_present's pace): the hand-off's
+     * publish count and the publish time on fbm_now's clock. */
+    uint64_t seq;
+    double   pub;
 };
 
 static struct fb_slot  s_slot[3];
@@ -128,6 +132,9 @@ static volatile int    s_in_present;         /* ack thread inside Present */
  * SDL_Renderer, and a slot is a GPU texture in fb_present_metal.m (indexed by
  * slot number) rather than bytes. Set once before the guest starts. */
 static int             s_layer;
+/* Layer mode with RECOMP_TRACE=pacing: publish stamps its slot and the
+ * presenter reports what reached the screen. Set once before the guest. */
+static int             s_pace;
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -232,12 +239,18 @@ static void publish(uint32_t w, uint32_t h, uint32_t bpp, uint64_t t0)
     s->h = h;
     s->bpp = bpp;
     s->flip = nv2a_pb_gpu_state()->flips;
+#if defined(__APPLE__)
+    if (s_pace)
+        s->pub = fbm_now();
+#endif
     pthread_mutex_lock(&s_lock);
     {
         int t = s_ready;
         s_ready = s_back;
         s_back = t;
         s_ready_seq++;
+        if (s_pace)
+            s->seq = s_ready_seq;
     }
     pthread_mutex_unlock(&s_lock);
 
@@ -1025,8 +1038,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 fullscreen_mode_set(win);
             if (!win)
                 snprintf(why, sizeof why, "%s", SDL_GetError());
-            else if (fbm_create(win, vsync, s_shot_n > 0, why, sizeof why))
+            else if (fbm_create(win, vsync, s_shot_n > 0, why, sizeof why)) {
                 s_layer = dirty = 1;   /* paint black before the first frame */
+                s_pace = recomp_env_on(RENV_PACING_TRACE);
+            }
             if (!s_layer) {
                 fbm_destroy();
                 if (win)
@@ -1295,11 +1310,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             const struct nv2a_ovl_list *const *ls = NULL;
             int nls = 0;
 #endif
+            struct fbm_pace_frame pf = { shown_seq ? f->seq : 0, f->pub };
             if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             if (fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
                             f->n, f->pad, filter, shoot ? path : NULL, shown_flip,
-                            nls ? ls : NULL, nls)) {
+                            nls ? ls : NULL, nls, s_pace ? &pf : NULL)) {
                 dirty = 0;
                 shoot = 0;
                 presents++;

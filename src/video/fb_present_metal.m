@@ -38,6 +38,11 @@
  *                  rectangle in place of the triangle; the overlay follows
  *                  in a second pass. Built on the main thread when the
  *                  request's generation moves; "none" never loads it.
+ *   pacing         RECOMP_TRACE=pacing: each present's drawable and command
+ *                  buffer get a presented and a completed handler, and a
+ *                  [PRESENT] line every 600 presents or 10 s says what
+ *                  reached the screen (new, repeat, skipped, dropped), the
+ *                  new images' interval and age, and the pass's GPU time.
  *
  * Manual retain/release, like nv2a_pb_metal.m. Every entry point is wrapped in
  * an autorelease pool: the main loop and the ack thread have none of their own.
@@ -48,10 +53,12 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
+#import <QuartzCore/CABase.h>       /* CACurrentMediaTime */
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -793,9 +800,193 @@ static id fx_get(uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh)
     return nil;
 }
 
+double fbm_now(void)
+{
+    return CACurrentMediaTime();
+}
+
+/* RECOMP_TRACE=pacing (fbm_present's pace): what each present really put on
+ * screen. One record a present, claimed on the main thread after
+ * nextDrawable; the drawable's presented handler and the command buffer's
+ * completed handler (any thread, possibly at once) each write only their own
+ * field of it and then set their own done flag; the main thread reads a
+ * record once both flags are set, in submit order, after the commit. A
+ * full table skips the handlers for that present ("untracked"): nothing
+ * waits, and a record is never reused while a handler may still write it.
+ *
+ *   skipped  frames published (hand-off seq) that no present was ever
+ *            submitted with: the gap between consecutive submitted seqs.
+ *   dropped  a present the system never showed (presentedTime 0).
+ *   new      shown, with a seq past the last one shown.
+ *   repeat   shown, with the seq already on screen.
+ * Presents before the first frame (seq 0, the black paint) are not counted.
+ * age is presentedTime - publish time, for new images only (the first time
+ * a frame is on screen); the interval is between consecutive new images'
+ * presentedTime. The GPU time is the whole present command buffer's
+ * (GPUEndTime - GPUStartTime): MetalFX, the shader chain and a shot blit
+ * included when they run. */
+#define PACE_RECS 64
+#define PACE_SAMPLES 4096
+static struct pace_rec {
+    uint64_t seq, skip;
+    double pub;
+    double shown;               /* the presented handler's */
+    double gpu;                 /* the completed handler's */
+    int shown_done, gpu_done;   /* atomics: the handlers' release stores */
+} s_pr[PACE_RECS];
+static uint64_t s_pr_head, s_pr_tail;  /* main only: oldest live, next to claim */
+static uint64_t s_pc_sub_seq;          /* the last seq submitted */
+static uint64_t s_pc_shown_seq;        /* the last seq on screen */
+static double s_pc_last_new;           /* presentedTime of the last new image */
+static struct pace_win {        /* main only: the line being gathered */
+    double t0;
+    unsigned shown, fresh, repeat, dropped, untracked;
+    uint64_t skipped;
+    unsigned ni, na, ng;
+    float iv[PACE_SAMPLES], age[PACE_SAMPLES], gpu[PACE_SAMPLES];
+} s_pw;
+
+static int pace_cmp(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* p (0..1) of the sorted v[0..n) in ms with dec decimals, or "-" when empty. */
+static const char *pace_pct(const float *v, unsigned n, double p, int dec, char *buf,
+                            size_t bn)
+{
+    if (!n)
+        return "-";
+    snprintf(buf, bn, "%.*f", dec, (double)v[(size_t)(p * (n - 1) + 0.5)]);
+    return buf;
+}
+
+/* The first present counted in a line (shown or untracked) starts its 10 s. */
+static void pace_arm(void)
+{
+    if (!s_pw.shown && !s_pw.untracked)
+        s_pw.t0 = CACurrentMediaTime();
+}
+
+static void pace_print(void)
+{
+    char a[16], b[16], c[16], d[16], e[16], f[16];
+    double gmean = 0;
+    unsigned i;
+
+    qsort(s_pw.iv, s_pw.ni, sizeof *s_pw.iv, pace_cmp);
+    qsort(s_pw.age, s_pw.na, sizeof *s_pw.age, pace_cmp);
+    qsort(s_pw.gpu, s_pw.ng, sizeof *s_pw.gpu, pace_cmp);
+    for (i = 0; i < s_pw.ng; i++)
+        gmean += s_pw.gpu[i];
+    if (s_pw.ng)
+        gmean /= s_pw.ng;
+    fprintf(stderr, "[PRESENT] shown %u: new %u repeat %u skipped %llu dropped %u"
+            " \xc2\xb7 new-image interval p50 %s p95 %s ms \xc2\xb7 age p50 %s p95 %s ms"
+            " \xc2\xb7 present pass gpu %.2f ms (p50 %s p95 %s)",
+            s_pw.shown, s_pw.fresh, s_pw.repeat, (unsigned long long)s_pw.skipped,
+            s_pw.dropped,
+            pace_pct(s_pw.iv, s_pw.ni, 0.50, 1, a, sizeof a),
+            pace_pct(s_pw.iv, s_pw.ni, 0.95, 1, b, sizeof b),
+            pace_pct(s_pw.age, s_pw.na, 0.50, 1, c, sizeof c),
+            pace_pct(s_pw.age, s_pw.na, 0.95, 1, d, sizeof d),
+            gmean,
+            pace_pct(s_pw.gpu, s_pw.ng, 0.50, 2, e, sizeof e),
+            pace_pct(s_pw.gpu, s_pw.ng, 0.95, 2, f, sizeof f));
+    if (s_pw.untracked)
+        fprintf(stderr, " untracked %u", s_pw.untracked);
+    fputc('\n', stderr);
+    /* The counters; the samples are overwritten, not read past the counts. */
+    memset(&s_pw, 0, offsetof(struct pace_win, iv));
+}
+
+/* The records both handlers are done with, oldest first; a line every 600
+ * shown or 10 s. Main thread, after the commit. */
+static void pace_drain(void)
+{
+    while (s_pr_head != s_pr_tail) {
+        struct pace_rec *r = &s_pr[s_pr_head % PACE_RECS];
+        if (!__atomic_load_n(&r->shown_done, __ATOMIC_ACQUIRE)
+                || !__atomic_load_n(&r->gpu_done, __ATOMIC_ACQUIRE))
+            break;
+        s_pr_head++;
+        pace_arm();
+        s_pw.shown++;
+        s_pw.skipped += r->skip;
+        if (r->gpu > 0 && s_pw.ng < PACE_SAMPLES)
+            s_pw.gpu[s_pw.ng++] = (float)(r->gpu * 1e3);
+        if (r->shown <= 0) {
+            s_pw.dropped++;
+        } else if (r->seq > s_pc_shown_seq) {
+            s_pw.fresh++;
+            if (s_pw.na < PACE_SAMPLES)
+                s_pw.age[s_pw.na++] = (float)((r->shown - r->pub) * 1e3);
+            if (s_pc_last_new > 0 && s_pw.ni < PACE_SAMPLES)
+                s_pw.iv[s_pw.ni++] = (float)((r->shown - s_pc_last_new) * 1e3);
+            s_pc_last_new = r->shown;
+            s_pc_shown_seq = r->seq;
+        } else {
+            s_pw.repeat++;
+        }
+    }
+    /* untracked counts too: a handler that never fires fills the table, and
+     * the line keeps coming, saying so, instead of the trace going quiet. */
+    if (s_pw.shown >= 600
+            || ((s_pw.shown || s_pw.untracked) && CACurrentMediaTime() - s_pw.t0 >= 10.0))
+        pace_print();
+}
+
+/* A record for this present's handlers, or NULL (before the first frame,
+ * or the table full). */
+static struct pace_rec *pace_claim(const struct fbm_pace_frame *pf)
+{
+    struct pace_rec *r;
+    uint64_t skip;
+    if (!pf->seq)
+        return NULL;
+    skip = pf->seq > s_pc_sub_seq + 1 ? pf->seq - s_pc_sub_seq - 1 : 0;
+    if (pf->seq > s_pc_sub_seq)
+        s_pc_sub_seq = pf->seq;
+    if (s_pr_tail - s_pr_head >= PACE_RECS) {
+        pace_arm();
+        s_pw.untracked++;
+        s_pw.skipped += skip;
+        return NULL;
+    }
+    r = &s_pr[s_pr_tail++ % PACE_RECS];
+    r->seq = pf->seq;
+    r->pub = pf->pub;
+    r->skip = skip;
+    r->shown = r->gpu = 0;
+    __atomic_store_n(&r->shown_done, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&r->gpu_done, 0, __ATOMIC_RELAXED);
+    return r;
+}
+
+/* Both handlers on cb and d, before presentDrawable and the commit. Without
+ * addPresentedHandler (before macOS 10.15.4) the record counts as dropped. */
+static void pace_handlers(struct pace_rec *r, id<CAMetalDrawable> d, id<MTLCommandBuffer> cb)
+{
+    if (@available(macOS 10.15.4, *)) {
+        [d addPresentedHandler:^(id<MTLDrawable> dr) {
+            r->shown = [dr presentedTime];
+            __atomic_store_n(&r->shown_done, 1, __ATOMIC_RELEASE);
+        }];
+    } else {
+        __atomic_store_n(&r->shown_done, 1, __ATOMIC_RELEASE);
+    }
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        CFTimeInterval a = [c GPUStartTime], b = [c GPUEndTime];
+        r->gpu = b > a ? b - a : 0;
+        __atomic_store_n(&r->gpu_done, 1, __ATOMIC_RELEASE);
+    }];
+}
+
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 uint32_t pad, int filter, const char *shot_path, uint32_t flip,
-                const struct nv2a_ovl_list *const *layers, int nlayers)
+                const struct nv2a_ovl_list *const *layers, int nlayers,
+                const struct fbm_pace_frame *pace)
 {
     int ok = 0;
 
@@ -811,6 +1002,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         CGSize cur = s_layer.drawableSize;
         int internal = s_internal;
         int fx = fx_wanted(), scaled = 0;
+        struct pace_rec *pr = NULL;
 #ifdef XBOXRECOMP_ENHANCE
         libra_mtl_filter_chain_t chain = NULL;
         int chained = 0;
@@ -1072,6 +1264,8 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 [b endEncoding];
             }
         }
+        if (pace && (pr = pace_claim(pace)))
+            pace_handlers(pr, d, cb);   /* before presentDrawable and the commit */
         [cb presentDrawable:d];
         [cb commit];
         [s_slot_cb[k] release];
@@ -1081,6 +1275,8 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
             save_shot(shot, (uint32_t)dw, (uint32_t)dh, shot_path, flip);
             [shot release];
         }
+        if (pace)
+            pace_drain();   /* after the commit: no drawable is held across it */
         ok = 1;
     }
     return ok;

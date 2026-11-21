@@ -15,12 +15,25 @@ void  fbm_get(void **device, void **queue);
 void *fbm_slot(int k, uint32_t w, uint32_t h);
 int   fbm_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pitch,
                  uint32_t bpp);
+/* RECOMP_TRACE=pacing: the frame a present shows, for the presenter's
+ * [PRESENT] cadence and age line. seq is the hand-off's publish count of
+ * the slot (0 before the first frame: not counted), pub its publish time on
+ * fbm_now's clock. */
+struct fbm_pace_frame {
+    uint64_t seq;
+    double   pub;
+};
+/* CACurrentMediaTime(): seconds on the host clock presentedTime is in
+ * (mach_absolute_time's, which stops while the machine sleeps). Any thread. */
+double fbm_now(void);
 /* layers: the overlay's visible lists (nv2a_overlay.h), drawn over the
- * frame in the same pass; NULL and 0 when none is visible. */
+ * frame in the same pass; NULL and 0 when none is visible. pace: NULL when
+ * the pacing trace is off (no handlers, no extra work). */
 struct nv2a_ovl_list;
 int   fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                   uint32_t pad, int filter, const char *shot_path, uint32_t flip,
-                  const struct nv2a_ovl_list *const *layers, int nlayers);
+                  const struct nv2a_ovl_list *const *layers, int nlayers,
+                  const struct fbm_pace_frame *pace);
 
 /* The window's NSWindow level: above the menu bar and the Dock
  * (kCGMainMenuWindowLevel + 1, where SDL puts a fullscreen window without
