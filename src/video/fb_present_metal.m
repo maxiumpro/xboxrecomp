@@ -260,8 +260,7 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             long nd = recomp_env_int(RENV_METAL_DRAWABLES, 3);
             s_layer.maximumDrawableCount = nd == 2 ? 2 : 3;
             if (nd == 2)
-                fprintf(stderr, "[PRESENT] metal_drawables=2: maximumDrawableCount 2
-");
+                fprintf(stderr, "[PRESENT] metal_drawables=2: maximumDrawableCount 2\n");
         }
         s_layer.allowsNextDrawableTimeout = YES;
         s_internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
