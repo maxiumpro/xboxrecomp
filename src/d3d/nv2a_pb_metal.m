@@ -196,6 +196,15 @@ static id<MTLCommandBuffer>        s_cmd;      /* the frame's, begun lazily */
 static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
 static int                         s_failed;
 static int                         s_unified;  /* shared textures readable */
+/* RECOMP_DEBUG=metal_rt_private=1 (unified memory only): colour targets in
+ * Private storage, every CPU read or write of one through s_stage, a Shared
+ * buffer grown on demand. s_stage_tex: the texture whose whole hw x hh the
+ * staging holds (rt_managed_sync's blit), NULL when none. */
+static int                         s_rtp;
+static id<MTLBuffer>               s_stage;
+static size_t                      s_stage_cap;
+static const void                 *s_stage_tex;
+static uint64_t                    s_stage_reads, s_stage_writes;
 static int                         s_bc;       /* BC1 and BC3 textures sample (pack entries) */
 
 /* Vertex and index rings, reset after every wait (flip or overflow). */
@@ -1618,6 +1627,10 @@ static int init(void)
             return 0;
         }
         s_unified = [s_dev hasUnifiedMemory] ? 1 : 0;
+        s_rtp = s_unified && recomp_env_on(RENV_METAL_RT_PRIVATE);
+        if (s_rtp)
+            fprintf(stderr, LOGP "metal_rt_private=1: color render targets in Private storage,"
+                    " CPU reads/writes through a staging blit\n");
         /* Every Mac GPU samples BC; an iPad before the A-series GPUs that
          * report it does not, and its pack BC3 entries go up from the guest. */
 #if TARGET_OS_OSX
@@ -1874,7 +1887,68 @@ static id<MTLTexture> rt_texture_new(uint32_t hw, uint32_t hh)
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     td.storageMode = s_unified ? MTLStorageModeShared : MTLStorageModeManaged;
 #pragma clang diagnostic pop
+    if (s_rtp)
+        td.storageMode = MTLStorageModePrivate;
     return [s_dev newTextureWithDescriptor:td];
+}
+
+/* metal_rt_private: s_stage at least `need` bytes. Nothing in flight uses
+ * the old one: every staging blit is waited for before the next. */
+static int stage_fit(size_t need)
+{
+    if (s_stage_cap >= need)
+        return 1;
+    [s_stage release];
+    s_stage = [s_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
+    s_stage_cap = s_stage ? need : 0;
+    s_stage_tex = NULL;
+    return s_stage != nil;
+}
+
+/* getBytes of rt->tex's region r, rows bpr apart at dst. metal_rt_private:
+ * from the staging copy rt_managed_sync queued and the caller's wait
+ * completed (every read site syncs first); none of this texture: skipped. */
+static void rt_get(const RenderTarget *rt, void *dst, NSUInteger bpr, MTLRegion r)
+{
+    const uint8_t *s;
+    NSUInteger y;
+
+    if (!s_rtp) {
+        [rt->tex getBytes:dst bytesPerRow:bpr fromRegion:r mipmapLevel:0];
+        return;
+    }
+    if (s_stage_tex != (const void *)rt->tex) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "metal_rt_private: surface 0x%08X read with no staged copy,"
+                    " skipped\n", rt->offset);
+        return;
+    }
+    s = (const uint8_t *)[s_stage contents]
+        + ((size_t)r.origin.y * rt->hw + r.origin.x) * 4u;
+    for (y = 0; y < r.size.height; y++)
+        memcpy((uint8_t *)dst + y * bpr, s + y * (size_t)rt->hw * 4u, r.size.width * 4u);
+}
+
+/* metal_rt_private: rt_seed's pixels (rw x rh, tight rows) are in s_stage;
+ * blit them into tex on a command buffer of its own, committed and waited
+ * for now. It is enqueued ahead of the frame's s_cmd (not committed yet), so
+ * every pass that uses tex, and rt_grow's later blit of the old contents,
+ * runs after it; and s_stage is free again on return. */
+static void stage_write(id<MTLTexture> tex, uint32_t rw, uint32_t rh)
+{
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+        [b copyFromBuffer:s_stage sourceOffset:0 sourceBytesPerRow:(NSUInteger)rw * 4u
+              sourceBytesPerImage:(NSUInteger)rw * 4u * rh sourceSize:MTLSizeMake(rw, rh, 1)
+                toTexture:tex destinationSlice:0 destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [b endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    s_stage_writes++;
 }
 
 /* tex (w x h guest, hw x hh host) from the guest's bytes at addr when the
@@ -1888,6 +1962,26 @@ static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w
     if (pitch < w * 4u)
         return 0;
     guard_open();   /* our own read of the seed is not a title read */
+    if (s_rtp) {
+        /* Private: the same pixels into s_stage, then a blit (stage_write). */
+        uint8_t *st;
+        uint32_t y;
+        if (!stage_fit((size_t)hw * hh * 4u))
+            return 0;
+        st = (uint8_t *)[s_stage contents];
+        s_stage_tex = NULL;   /* it holds the seed now */
+        if (hw == w) {
+            for (y = 0; y < h; y++)
+                memcpy(st + (size_t)y * w * 4u, src + (size_t)y * pitch, (size_t)w * 4u);
+            stage_write(tex, w, h);
+        } else {
+            unsigned n = hw / (w + 2u * pad);
+            memset(st, 0, (size_t)hw * hh * 4u);
+            nv2a_upscale_nearest32(src, pitch, w, h, n, st + (size_t)pad * n * 4u, hw * 4u);
+            stage_write(tex, hw, hh);
+        }
+        return 1;
+    }
     if (hw == w) {
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                  withBytes:src bytesPerRow:pitch];
@@ -5309,8 +5403,7 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
     uint32_t bpp = pitch / rt->w, w = rt->w, y;
 
     if (bpp >= 4) {
-        [rt->tex getBytes:dst bytesPerRow:pitch fromRegion:MTLRegionMake2D(0, 0, w, rt->h)
-              mipmapLevel:0];
+        rt_get(rt, dst, pitch, MTLRegionMake2D(0, 0, w, rt->h));
         fix32(rt, dst, pitch, rt->h);
     } else if (bpp == 2) {
         static uint32_t *row;
@@ -5324,8 +5417,7 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
         }
         for (y = 0; y < rt->h; y++) {
             uint16_t *o = (uint16_t *)(dst + (size_t)y * pitch);
-            [rt->tex getBytes:row bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, y, w, 1)
-                  mipmapLevel:0];
+            rt_get(rt, row, w * 4, MTLRegionMake2D(0, y, w, 1));
             pack16(rt, row, o, w);
         }
     } else {
@@ -5350,8 +5442,7 @@ static const uint8_t *host_readback(RenderTarget *rt)
         px = n;
         cap = need;
     }
-    [rt->tex getBytes:px bytesPerRow:rt->hw * 4u
-           fromRegion:MTLRegionMake2D(0, 0, rt->hw, rt->hh) mipmapLevel:0];
+    rt_get(rt, px, rt->hw * 4u, MTLRegionMake2D(0, 0, rt->hw, rt->hh));
     return px;
 }
 
@@ -5417,11 +5508,26 @@ static void rt_managed_sync(RenderTarget *rt)
 {
     id<MTLBlitCommandEncoder> b;
 
-    if (s_unified)
+    if (s_unified && !s_rtp)
         return;
+    if (s_rtp && !stage_fit((size_t)rt->hw * rt->hh * 4u))
+        return;   /* s_stage_tex NULL: rt_get skips the read */
     end_encoder();   /* for the caller's reason (metal_passes): readback, flip, host-pixels */
     ensure_cmd();
     b = pt_on() ? pt_blit(PT_SYNC, NV2A_GCAT_OTHER) : [s_cmd blitCommandEncoder];
+    if (s_rtp) {
+        /* metal_rt_private: the whole texture into s_stage, after every pass
+         * already encoded; the caller's wait completes it, then rt_get. */
+        [b copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0
+              sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(rt->hw, rt->hh, 1)
+                  toBuffer:s_stage destinationOffset:0
+    destinationBytesPerRow:(NSUInteger)rt->hw * 4u
+  destinationBytesPerImage:(NSUInteger)rt->hw * 4u * rt->hh];
+        [b endEncoding];
+        s_stage_tex = (const void *)rt->tex;
+        s_stage_reads++;
+        return;
+    }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     [b synchronizeResource:rt->tex];
@@ -6593,6 +6699,9 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_blits_guest);
     if (stats_on && (s_presents % 300) == 0 && s_dof_skipped)
         fprintf(stderr, LOGP "dof_skip: %llu draws skipped\n", (unsigned long long)s_dof_skipped);
+    if (periodic && s_rtp)
+        fprintf(stderr, LOGP "metal_rt_private: staging reads %llu, writes %llu\n",
+                (unsigned long long)s_stage_reads, (unsigned long long)s_stage_writes);
     if (s_zt_binds && stats_on && (s_presents % 300) == 0)
         fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
                 (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);
@@ -6631,8 +6740,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         }
         if (cap >= need) {
             t = prof_t();
-            [rt->tex getBytes:px bytesPerRow:cw * 4u
-                   fromRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0];
+            rt_get(rt, px, cw * 4u, MTLRegionMake2D(0, 0, cw, ch));
             prof_add(&s_pa.winrb, t);
             t = prof_t();
             xbox_FramebufferWindowPresentPixels(px, cw, ch, cw * 4u, 4u);
