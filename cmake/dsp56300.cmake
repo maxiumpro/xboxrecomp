@@ -63,6 +63,12 @@ set(XBOXRECOMP_DSP56300_ARCHIVE "" CACHE FILEPATH
     "Local dsp56300 release tarball for this target (default: download it)")
 set(XBOXRECOMP_DSP56300_CACHE "${CMAKE_BINARY_DIR}/_deps/dsp56300" CACHE PATH
     "Download and extraction directory for the dsp56300 release")
+# No release archive is built for MSVC. A dsp56300 built from its source for
+# x86_64-pc-windows-msvc (cargo build --release -p dsp56300-emu-ffi) can be
+# linked instead: a directory with lib/dsp56300_emu_ffi.lib and
+# include/dsp56300.h. Unset (the default), an MSVC build has no DSP.
+set(XBOXRECOMP_DSP56300_MSVC_DIR "" CACHE PATH
+    "A dsp56300 built locally for MSVC: lib/dsp56300_emu_ffi.lib and include/dsp56300.h")
 
 # The Rust target triple of the archive this build links, or empty.
 function(_xboxrecomp_dsp56300_triple out)
@@ -82,6 +88,8 @@ function(_xboxrecomp_dsp56300_triple out)
     endif()
     if(arch AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         set(triple ${arch}-apple-darwin)
+    elseif(arch AND WIN32 AND MSVC AND XBOXRECOMP_DSP56300_MSVC_DIR)
+        set(triple ${arch}-pc-windows-msvc)    # a local build, no archive
     elseif(arch AND WIN32 AND NOT MSVC)
         # The archives are built for the GNU ABI: x86-64 against mingw-w64,
         # arm64 against llvm-mingw (gnullvm). MSVC links neither.
@@ -175,6 +183,24 @@ endfunction()
 function(xboxrecomp_dsp56300 out_target out_reason)
     set(${out_target} "" PARENT_SCOPE)
     if(TARGET dsp56300::emu)
+        set(${out_target} dsp56300::emu PARENT_SCOPE)
+        set(${out_reason} "" PARENT_SCOPE)
+        return()
+    endif()
+    if(MSVC AND XBOXRECOMP_DSP56300_MSVC_DIR)
+        set(root "${XBOXRECOMP_DSP56300_MSVC_DIR}")
+        if(NOT EXISTS "${root}/lib/dsp56300_emu_ffi.lib"
+           OR NOT EXISTS "${root}/include/dsp56300.h")
+            message(FATAL_ERROR "dsp56300: ${root} has no lib/dsp56300_emu_ffi.lib "
+                "and include/dsp56300.h (XBOXRECOMP_DSP56300_MSVC_DIR)")
+        endif()
+        add_library(dsp56300::emu STATIC IMPORTED GLOBAL)
+        set_target_properties(dsp56300::emu PROPERTIES
+            IMPORTED_LOCATION "${root}/lib/dsp56300_emu_ffi.lib"
+            INTERFACE_INCLUDE_DIRECTORIES "${root}/include")
+        set_property(TARGET dsp56300::emu PROPERTY INTERFACE_LINK_LIBRARIES
+            ws2_32 userenv ntdll bcrypt advapi32 kernel32 synchronization)
+        message(STATUS "dsp56300: local MSVC build (${root})")
         set(${out_target} dsp56300::emu PARENT_SCOPE)
         set(${out_reason} "" PARENT_SCOPE)
         return()
