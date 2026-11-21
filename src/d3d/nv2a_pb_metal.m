@@ -7487,6 +7487,157 @@ static void gpu_spin_flip(void)
     last = [cb retain];
 }
 
+/* RECOMP_DEBUG=metal_cal_passes=N, metal_cal_tex=1 (KFC-1105): a probe to
+ * calibrate metal_gpu_blocks. Before the flip's commit, N extra render
+ * passes in the frame's own command buffer, each its own pass: a triangle
+ * over a private 2560x1920 BGRA8 target (load DontCare, store Store) whose
+ * fragment returns a constant, or with metal_cal_tex=1 samples (linear) a
+ * 2560x1920 texture filled with a pattern. They are timed as any pass (the
+ * "other" block of metal_gpu_blocks, so in its busy time); with
+ * metal_ab_alt only in arm B. Off (N = 0): no texture, no pipeline. */
+#define XCAL_W 2560u
+#define XCAL_H 1920u
+static const char s_xcal_msl[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct XcalOut { float4 pos [[position]]; };\n"
+    "vertex XcalOut xcal_vs(uint vid [[vertex_id]])\n"
+    "{\n"
+    "    float2 p = float2(float((vid << 1) & 2u), float(vid & 2u));\n"
+    "    XcalOut o;\n"
+    "    o.pos = float4(p * 2.0f - 1.0f, 0.0f, 1.0f);\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 xcal_fs(XcalOut in [[stage_in]])\n"
+    "{\n"
+    "    return float4(0.25f, 0.5f, 0.75f, 1.0f);\n"
+    "}\n"
+    "fragment float4 xcal_fs_tex(XcalOut in [[stage_in]],\n"
+    "                            texture2d<float> t [[texture(0)]])\n"
+    "{\n"
+    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "    return t.sample(s, in.pos.xy / float2(2560.0f, 1920.0f));\n"
+    "}\n";
+
+static void xcal_frame(void)
+{
+    static int n = -1, use_tex;
+    static id<MTLTexture> dst, src;
+    static id<MTLRenderPipelineState> pso;
+    int i;
+
+    if (n < 0) {
+        NSError *err = nil;
+        id<MTLLibrary> lib;
+        id<MTLFunction> vs, fs;
+        long v = recomp_env_int(RENV_METAL_CAL_PASSES, 0);
+        n = v > 0 ? (int)(v > 64 ? 64 : v) : 0;
+        use_tex = n && recomp_env_on(RENV_METAL_CAL_TEX);
+        if (!n || !s_dev)
+            n = 0;
+        if (n) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                             width:XCAL_W height:XCAL_H mipmapped:NO];
+            td.storageMode = MTLStorageModePrivate;
+            td.usage = MTLTextureUsageRenderTarget;
+            dst = [s_dev newTextureWithDescriptor:td];
+            if (use_tex) {
+                uint32_t *px = (uint32_t *)malloc((size_t)XCAL_W * XCAL_H * 4u);
+                td = [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                 width:XCAL_W height:XCAL_H mipmapped:NO];
+                td.storageMode = MTLStorageModeShared;
+                td.usage = MTLTextureUsageShaderRead;
+                src = px ? [s_dev newTextureWithDescriptor:td] : nil;
+                if (src) {
+                    uint32_t x, y;
+                    for (y = 0; y < XCAL_H; y++)
+                        for (x = 0; x < XCAL_W; x++)
+                            px[(size_t)y * XCAL_W + x] = 0xFF000000u | ((x ^ y) & 0xFFu) << 16
+                                                         | (x & 0xFFu) << 8 | (y & 0xFFu);
+                    [src replaceRegion:MTLRegionMake2D(0, 0, XCAL_W, XCAL_H) mipmapLevel:0
+                             withBytes:px bytesPerRow:XCAL_W * 4u];
+                }
+                free(px);
+            }
+            lib = metal_compile_library(s_dev, [NSString stringWithUTF8String:s_xcal_msl],
+                                        "xcal", &err);
+            vs = lib ? [lib newFunctionWithName:@"xcal_vs"] : nil;
+            fs = lib ? [lib newFunctionWithName:use_tex ? @"xcal_fs_tex" : @"xcal_fs"] : nil;
+            if (vs && fs && dst && (!use_tex || src)) {
+                MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+                pd.vertexFunction = vs;
+                pd.fragmentFunction = fs;
+                pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+                [pd release];
+            }
+            [vs release];
+            [fs release];
+            [lib release];
+            if (!pso) {
+                fprintf(stderr, LOGP "metal_cal_passes: no pipeline or target (%s), off\n",
+                        err ? [[err localizedDescription] UTF8String] : "?");
+                n = 0;
+            } else {
+                fprintf(stderr, LOGP "KFC-1105: metal_cal_passes=%d: %d extra full-screen passes"
+                        " a flip on a %ux%u BGRA8 target, %s%s\n", n, n, XCAL_W, XCAL_H,
+                        use_tex ? "each samples a texture (metal_cal_tex)" : "constant colour",
+                        s_ab_blk ? "; arm B only (metal_ab_alt)" : "");
+            }
+        }
+    }
+    if (n <= 0 || !nd_arm_b())
+        return;
+    PT_WHY(PT_FLIP);
+    end_encoder();   /* the scene's last pass closes as flush would have closed it */
+    ensure_cmd();
+    for (i = 0; i < n; i++) {
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        id<MTLRenderCommandEncoder> e;
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (pt_on()) {
+            /* a pass with a draw, in the "other" block (no block of its own: the
+             * categories are the backends' shared enum) */
+            int idx;
+            PtPass *p = pt_new(PTK_RENDER, PT_FLIP, &idx);
+            if (p) {
+                p->cat = NV2A_GCAT_OTHER;
+                p->close_why = PT_FLIP;
+                p->draws = 1;
+                p->first_seen = 1;
+                p->cat_draws[NV2A_GCAT_OTHER] = 1;
+                s_pts.close[PT_FLIP]++;
+                if (gb_on()) {
+                    if (@available(macOS 11.0, iOS 14.0, *)) {
+                        int base = gb_take(4);
+                        if (base >= 0) {
+                            MTLRenderPassSampleBufferAttachmentDescriptor *a =
+                                rp.sampleBufferAttachments[0];
+                            a.sampleBuffer = (id<MTLCounterSampleBuffer>)s_gb_sb[s_presents & 1];
+                            a.startOfVertexSampleIndex = (NSUInteger)base;
+                            a.endOfVertexSampleIndex = (NSUInteger)base + 1;
+                            a.startOfFragmentSampleIndex = (NSUInteger)base + 2;
+                            a.endOfFragmentSampleIndex = (NSUInteger)base + 3;
+                            p->gb = base;
+                            p->g_open = gb_now();
+                        }
+                    }
+                }
+            }
+        }
+        e = [s_cmd renderCommandEncoderWithDescriptor:rp];
+        [e setRenderPipelineState:pso];
+        if (use_tex)
+            [e setFragmentTexture:src atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [e endEncoding];
+    }
+}
+
 /* The end of each flip's GPU work, before s_presents moves on (KFC-1720 H1b
  * step 4): the flip's last submission noted (s_flip_sub), the frames with
  * work committed and not done counted (s_ifl_*: this one and the one before
@@ -7564,6 +7715,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 PT_WHY(PT_FLIP);
                 cap_encode(rt, hcw, hch);
             }
+            xcal_frame();   /* RECOMP_DEBUG=metal_cal_passes: off, returns */
             t = prof_t();
             PT_WHY(PT_FLIP);
             /* metal_inflight=2 (KFC-1720 H1b step 4): the frame is committed
