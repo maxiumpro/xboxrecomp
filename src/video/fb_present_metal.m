@@ -77,6 +77,7 @@
 #endif
 #include "fb_present_metal.h"
 #include "metal_compile.h"
+#include "recomp_env.h"
 
 #if __has_feature(objc_arc)
 #error "fb_present_metal.m is manual retain/release: build it without -fobjc-arc"
@@ -253,7 +254,15 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         }
         s_layer.framebufferOnly = shots ? NO : YES;
         s_layer.displaySyncEnabled = vsync ? YES : NO;
-        s_layer.maximumDrawableCount = 3;
+        /* RECOMP_DEBUG=metal_drawables=2 (KFC-2115, hub 20-nov): a probe of
+         * frame age (flip to presented), 2 drawables instead of 3 */
+        {
+            long nd = recomp_env_int(RENV_METAL_DRAWABLES, 3);
+            s_layer.maximumDrawableCount = nd == 2 ? 2 : 3;
+            if (nd == 2)
+                fprintf(stderr, "[PRESENT] metal_drawables=2: maximumDrawableCount 2
+");
+        }
         s_layer.allowsNextDrawableTimeout = YES;
         s_internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
         if (s_internal) {
