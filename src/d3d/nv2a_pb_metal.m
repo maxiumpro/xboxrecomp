@@ -45,8 +45,9 @@
  *  - Only the present surface is written back to guest memory, on demand
  *    (sync_guest, a texture decode that overlaps it, its eviction), or at
  *    every flip under metal_writeback=always.
- *  - Guest memory is touched on the executor's thread only: no completion
- *    handlers; a write-back waits for the command buffer and then copies.
+ *  - Guest memory is touched on the executor's thread only, never in a
+ *    completion handler; a write-back waits for the submission that last wrote the
+ *    surface (rt_read_ready) and then copies.
  *
  * Depth/stencil and render-to-texture as the D3D11 backend (M2); visibility
  * tests (GET_REPORT) from Metal visibility results through the shared
@@ -292,6 +293,15 @@ typedef struct {
     int            copy;       /* made by a 2D blit (metal_on_blit), not drawn since */
     uint32_t       copy_flip;  /* the flip of the blit that last filled it */
     uint64_t       zseq;       /* s_zseq at its last pass, draw or blit fill (zt_find) */
+    /* What a CPU read of its bytes (getBytes, or metal_rt_private's staging
+     * copy) waits for (rt_read_ready, KFC-1720 H1b step 3a): the newest
+     * submission that wrote tex (a pass, a blit), and the one with the copy
+     * for the CPU rt_managed_sync queued (synchronizeResource, or the
+     * staging blit), 0 none. wpend, spend: the open s_cmd has such a write,
+     * such a copy, numbered when flush commits it. wbad: last_write_sub
+     * ended in Error (sub_observe). */
+    int            wpend, spend, wbad;
+    uint64_t       last_write_sub, sync_sub;
 } RenderTarget;
 
 /* The order of colour and depth writes, for a depth surface sampled as a
@@ -315,6 +325,12 @@ static void occ_after_wait(void);
 static id<MTLBuffer> s_vis;      /* visibility result slots, 8 bytes each */
 static struct OccQuery *s_occ_q;     /* the query counting now, or NULL */
 static int s_occ_slot = -1;          /* its slot on s_enc */
+/* KFC-1720 H1b step 3a: flush, at each commit of s_cmd, gives its number to
+ * what the command buffer writes for the CPU to read: the visibility slots
+ * its passes count into (occ_committed) and the tex_mag trace's frame
+ * (mag_committed); render targets are numbered in flush itself. */
+static void occ_committed(uint64_t n);
+static void mag_committed(uint64_t n);
 
 /* RECOMP_TRACE=metal_prof: where on_flip's time goes, averaged over 300
  * flips: the wait for the frame's last command buffer, the GPU time of every
@@ -334,9 +350,6 @@ static struct {
 static int s_prof_ez;
 static uint64_t s_pa_ez_gpu[2], s_pa_ez_n[2];
 
-/* The last committed command buffer: a sync between flips waits for it when
- * nothing is open (a GET_REPORT commit may still be running). */
-static id<MTLCommandBuffer> s_last_cmd;
 static uint64_t s_decode_syncs;
 static uint64_t s_pitch_alias_binds;   /* binds over a dirty target nv2a_rt_pitch_alias
                                           * decoded without a write-back */
@@ -1521,18 +1534,28 @@ static uint64_t s_sub_last;     /* the newest number given out, 0 none */
 static uint64_t s_sub_floor;    /* every number up to this one is observed */
 static _Atomic uint64_t s_sub_errs;   /* ended in Error, counted by the handler */
 /* Why a sub_wait blocked: a flush(1)'s own wait (the serial flip's), the
- * seed blit's, a ring copy's reuse, a full table. */
-enum { SUBW_FLUSH, SUBW_STAGE, SUBW_RING, SUBW_FULL, SUBW_N };
+ * seed blit's, a ring copy's reuse, a full table, a GET_REPORT in
+ * RECOMP_METAL_OCC=sync (step 3a), a CPU read of a render target's bytes or
+ * of the tex_mag trace (step 3a). */
+enum { SUBW_FLUSH, SUBW_STAGE, SUBW_RING, SUBW_FULL, SUBW_REPORT, SUBW_READ, SUBW_N };
 static uint64_t s_subw_blocked[SUBW_N], s_subw_ns[SUBW_N];
+static uint64_t s_rb_skipped;   /* CPU reads skipped: the write's submission ended in Error */
 
 /* The handler has stored (done == n) or is about to: take its signal and
- * let the command buffer go. */
+ * let the command buffer go. A submission in Error marks the render targets
+ * it was the last write of (wbad), which outlives the entry's reuse. */
 static int sub_observe(SubEntry *e)
 {
     dispatch_semaphore_wait(e->sem, DISPATCH_TIME_FOREVER);
     e->bad = atomic_load_explicit(&e->err, memory_order_acquire) != 0;
     [e->cb release];
     e->cb = nil;
+    if (e->bad) {
+        int i;
+        for (i = 0; i < RT_MAX; i++)
+            if (s_rt[i].tex && s_rt[i].last_write_sub == e->n)
+                s_rt[i].wbad = 1;
+    }
     return e->bad ? -1 : 1;
 }
 
@@ -1587,6 +1610,31 @@ static void sub_wait_upto(uint64_t n, int why)
         sub_wait(s_sub_floor + 1, why);
         sub_reap();
     }
+}
+
+/* sub_wait without the wait: 1 when submission n is done (observed now if
+ * its handler has run), -1 done with status Error while its entry still
+ * says so, 0 not yet. 0 and numbers never given out are done. */
+static int sub_poll(uint64_t n)
+{
+    SubEntry *e;
+    if (!n || n > s_sub_last)
+        return 1;
+    e = &s_sub[n % SUB_TABLE];
+    if (e->n != n)
+        return 1;                     /* observed, the entry reused since */
+    if (!e->cb)
+        return e->bad ? -1 : 1;       /* observed */
+    if (atomic_load_explicit(&e->done, memory_order_acquire) == n)
+        return sub_observe(e);
+    return 0;
+}
+
+/* Every submission up to n is done (observed now where its handler ran). */
+static int sub_done_upto(uint64_t n)
+{
+    sub_reap();
+    return n <= s_sub_floor;
 }
 
 /* Number cb, register its completed handler, then commit it. */
@@ -1646,6 +1694,25 @@ static void flush(int wait)
         s_ring[s_ring_cur].last_sub = n;
         s_ring_bound = 0;
     }
+    /* What this command buffer writes for the CPU to read takes its number
+     * (KFC-1720 H1b step 3a): the targets it draws or copies into, their
+     * sync blits, the visibility slots it counts into, the tex_mag frame. */
+    {
+        int i;
+        for (i = 0; i < RT_MAX; i++) {
+            if (s_rt[i].wpend) {
+                s_rt[i].last_write_sub = n;
+                s_rt[i].wpend = 0;
+                s_rt[i].wbad = 0;
+            }
+            if (s_rt[i].spend) {
+                s_rt[i].sync_sub = n;
+                s_rt[i].spend = 0;
+            }
+        }
+    }
+    occ_committed(n);
+    mag_committed(n);
     if (flipping && s_gb_on > 0 && s_scene_close_ns) {
         double ms = (prof_now() - s_scene_close_ns) / 1e6;
         s_pts.cpu_n++;
@@ -1654,8 +1721,6 @@ static void flush(int wait)
             s_pts.cpu_max_ms = ms;
         s_scene_close_ns = 0;
     }
-    [s_last_cmd release];
-    s_last_cmd = [s_cmd retain];
     if (wait) {
         if (sub_wait(n, SUBW_FLUSH) < 0) {
             s_cmd_errors++;
@@ -1695,6 +1760,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     end_encoder();
     ensure_cmd();
     rt->dirty = 1;
+    rt->wpend = 1;   /* the pass writes it: s_cmd's number is its last write */
     nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = rt->tex;
@@ -2188,7 +2254,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     id<MTLTexture> tex;
     uint32_t hw, hh, pad;
     unsigned n;
-    int keep;
+    int keep, enc = 0;   /* enc: s_cmd writes the new texture (clear pass, blit) */
 
     pad = nv2a_host_pad(w, h);
     n = nv2a_host_size(w + 2u * pad, h, nv2a_host_scale_for(w, h), METAL_MAX_DIM, &hw, &hh);
@@ -2216,6 +2282,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
             (void)pt_aux(PTK_AUX, PT_GROW, NV2A_GCAT_OTHER);   /* metal_passes: counted, not timed */
         e = [s_cmd renderCommandEncoderWithDescriptor:rp];
         [e endEncoding];
+        enc = 1;
     }
     if (keep) {
         id<MTLBlitCommandEncoder> b;
@@ -2227,12 +2294,17 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
                  toTexture:tex destinationSlice:0 destinationLevel:0
          destinationOrigin:MTLOriginMake(0, 0, 0)];
         [b endEncoding];
+        enc = 1;
     }
     if (said++ < 20)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target grown to %ux%u\n",
                 rt->offset, rt->w, rt->h, w, h);
     [rt->tex release];   /* an encoded command keeps its own reference */
     rt->tex = tex;
+    /* A new texture: the seed is the CPU's (or stage_write's, waited for);
+     * a clear pass or the blit of the old contents is s_cmd's. */
+    rt->wbad = 0;
+    rt->wpend |= enc;
     rt->w = w;
     rt->h = h;
     rt->hw = hw;
@@ -3287,12 +3359,23 @@ static void stage_from_cache(int k)
 #define MAG_FRAMES 4u
 static struct {
     id<MTLBuffer>            buf;
-    id<MTLCommandBuffer>     cmd;    /* of the frame's last commit; nil: free */
+    /* The newest submission with a draw that writes it (mag_committed), 0
+     * none; at the flip the frame is out until that one is done. */
+    uint64_t                 sub;
     struct nv2a_tex_mag_draw *rec;
     unsigned                 n;
 } s_mag[MAG_FRAMES];
 static unsigned s_mag_cur;
 static int      s_mag_state;   /* 0 not tried, 1 ok, -1 failed */
+static int      s_mag_bound;   /* the open s_cmd has a draw that writes s_mag[s_mag_cur] */
+
+static void mag_committed(uint64_t n)
+{
+    if (s_mag_bound) {
+        s_mag[s_mag_cur].sub = n;
+        s_mag_bound = 0;
+    }
+}
 
 static int mag_init(void)
 {
@@ -3330,6 +3413,7 @@ static void mag_draw(void)
     [s_enc setFragmentBuffer:s_mag[s_mag_cur].buf
                       offset:(NSUInteger)id * NV2A_TEX_MAG_STAGES * 4u
                      atIndex:2];
+    s_mag_bound = 1;
 }
 
 /* A pre-transformed batch's figure: positions in surface pixels (slot 0)
@@ -3372,34 +3456,33 @@ static void mag_pretransformed(const float *vf, unsigned nf4, const int *slot,
     }
 }
 
-/* The frame goes with the flip's last command buffer; each frame whose
- * command buffer is done is folded, and the next one starts empty. */
+/* A frame goes with the newest submission that drew into it (its draws are
+ * in that one or earlier ones, all on s_queue); each frame whose submissions
+ * are done is folded, and the next one starts empty. */
 static void mag_fold_frame(unsigned k)
 {
     nv2a_tex_mag_fold(s_mag[k].rec, s_mag[k].n, (const uint32_t *)[s_mag[k].buf contents],
                       nv2a_host_render_scale());
     memset([s_mag[k].buf contents], 0, NV2A_TEX_MAG_BYTES);
     s_mag[k].n = 0;
-    [s_mag[k].cmd release];
-    s_mag[k].cmd = nil;
+    s_mag[k].sub = 0;
 }
 
+/* At the flip, once its command buffer is committed (s_mag_bound is 0). */
 static void mag_flip(void)
 {
     unsigned k, next = (s_mag_cur + 1u) % MAG_FRAMES;
     if (s_mag_state <= 0)
         return;
-    if (s_mag[s_mag_cur].n && s_last_cmd)
-        s_mag[s_mag_cur].cmd = [s_last_cmd retain];
     for (k = 0; k < MAG_FRAMES; k++)
-        if (s_mag[k].cmd && [s_mag[k].cmd status] >= MTLCommandBufferStatusCompleted)
+        if (s_mag[k].sub && sub_done_upto(s_mag[k].sub))
             mag_fold_frame(k);
-    if (s_mag[next].cmd) {
-        [s_mag[next].cmd waitUntilCompleted];
+    if (s_mag[next].sub) {
+        sub_wait_upto(s_mag[next].sub, SUBW_READ);
         mag_fold_frame(next);
     }
-    /* An empty frame stays current; one without a command buffer is too. */
-    if (s_mag[s_mag_cur].cmd || !s_mag[s_mag_cur].n)
+    /* An empty frame stays current; one no submission drew into is too. */
+    if (s_mag[s_mag_cur].sub || !s_mag[s_mag_cur].n)
         s_mag_cur = next;
 }
 
@@ -5731,6 +5814,7 @@ static void rt_managed_sync(RenderTarget *rt)
         [b endEncoding];
         s_stage_tex = (const void *)rt->tex;
         s_stage_reads++;
+        rt->spend = 1;   /* the CPU's copy: rt_read_ready waits for it too */
         return;
     }
 #pragma clang diagnostic push
@@ -5738,6 +5822,36 @@ static void rt_managed_sync(RenderTarget *rt)
     [b synchronizeResource:rt->tex];
 #pragma clang diagnostic pop
     [b endEncoding];
+    rt->spend = 1;   /* the CPU's copy: rt_read_ready waits for it too */
+}
+
+/* Before a CPU read of rt's bytes (getBytes, or metal_rt_private's staging
+ * copy): the submissions that make them visible, its last write (a pass, a
+ * blit) and the copy for the CPU rt_managed_sync queued (managed storage,
+ * metal_rt_private). The open s_cmd is committed first when it holds either
+ * (`why` tags its pass end, metal_passes), not otherwise; then exactly those
+ * submissions are waited for, not the frame. 0 when either ended in Error:
+ * the caller publishes nothing (counted), since the bytes are not that
+ * write's. KFC-1720 H1b step 3a. */
+static int rt_read_ready(RenderTarget *rt, int why)
+{
+    if (rt->wpend || rt->spend) {
+        PT_WHY(why);
+        flush(0);
+    }
+    sub_wait(rt->last_write_sub, SUBW_READ);   /* sub_observe marks wbad */
+    if (rt->sync_sub)
+        sub_wait(rt->sync_sub, SUBW_READ);
+    if (rt->wbad || (rt->sync_sub && sub_poll(rt->sync_sub) < 0)) {
+        static int said;
+        s_rb_skipped++;
+        if (!said++)
+            fprintf(stderr, LOGP "surface 0x%08X: its last write (submission %llu) ended in"
+                    " error; the CPU read of it is skipped (later ones counted)\n",
+                    rt->offset, (unsigned long long)rt->last_write_sub);
+        return 0;
+    }
+    return 1;
 }
 
 static void rt_sync(RenderTarget *rt, uint32_t pitch)
@@ -5749,17 +5863,18 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
         return;
     guard_open();
     @autoreleasepool {
+        int ok;
         if (pt_on() && s_pt_track)
             pt_read(rt->tex, 0, PTR_READBACK, -1);   /* metal_passes */
         PT_WHY(PT_SYNC);
         rt_managed_sync(rt);
-        PT_WHY(PT_SYNC);
-        if (s_cmd)
-            flush(1);
-        else if (s_last_cmd && [s_last_cmd status] < MTLCommandBufferStatusCompleted)
-            [s_last_cmd waitUntilCompleted];
+        /* Commits s_cmd only when it writes rt, and waits for that write's
+         * submission; a commit ends the pass, the rings keep their place. */
+        ok = rt_read_ready(rt, PT_SYNC);
         s_vb_pos = vb;
         s_ib_pos = ib;
+        if (!ok)
+            return;   /* still dirty: the guest keeps its bytes */
         if (rt->hw == rt->w)
             write_back(rt, rt->addr, pitch);
         else if ((px = host_readback(rt)) != NULL)
@@ -5865,9 +5980,8 @@ const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t
         if (rt->tex && rt->offset == offset) {
             PT_WHY(PT_HOST_PIXELS);
             rt_managed_sync(rt);
-            PT_WHY(PT_HOST_PIXELS);
-            if (s_cmd)
-                flush(1);
+            if (!rt_read_ready(rt, PT_HOST_PIXELS))
+                return NULL;
             *hw = rt->hw;
             *hh = rt->hh;
             return host_readback(rt);
@@ -6015,8 +6129,19 @@ static void guard_flip(uint32_t addr, uint32_t len)
  * the pass. A result is in once every slot's command buffer has completed,
  * so GET_REPORT commits the open command buffer: a count held to the flip
  * lands a frame later than D3D11's, and light shafts whose brightness
- * comes from the count come out too bright. A slot freed while
- * its command buffer is still in flight retires until the flip's wait.
+ * comes from the count come out too bright.
+ *
+ * Each slot, from its allocation to its release, is written by one
+ * submission (KFC-1720 H1b step 3a): s_vis_sub[slot], 0 while it is in the
+ * open s_cmd, numbered when flush commits it (occ_committed). The allocation
+ * is the slot's generation: a slot is allocated again only once released,
+ * and released (here, on the backend's thread) only once that submission is
+ * observed done, so the CPU's zeroing never races a GPU write; one freed
+ * before that goes on s_retire, and occ_retire releases it later, oldest
+ * first. A query's result is in when the submissions of all its slots are
+ * done (sub_poll), whatever the passes and ring cuts it spans; one that ended
+ * in Error answers visible, as an overflow does. The completed handlers only
+ * record completion (sub_commit); nothing here runs in them.
  *
  * At the end of each walk, before a semaphore release that follows a
  * report (both on_poll) and at the flip after its wait, nv2a_occ_settle
@@ -6029,14 +6154,15 @@ static void guard_flip(uint32_t addr, uint32_t len)
  * committed at GET_REPORT. occ_delay_us holds every result back (a test
  * hook for a slow GPU).
  *
- * RECOMP_METAL_OCC=sync waits at GET_REPORT; =fixed leaves reports to the
- * walker (RECOMP_ZPASS_FIXED, every test visible). */
+ * RECOMP_METAL_OCC=sync waits at GET_REPORT: the report's slots still in
+ * s_cmd are committed (flush(0)) and exactly their submissions waited for
+ * (SUBW_REPORT); =fixed leaves reports to the walker (RECOMP_ZPASS_FIXED,
+ * every test visible). */
 #define OCC_QSLOTS 16
 /* Pending and retired reports, a query each at least, and the open ones. */
 #define OCC_POOL   (NV2A_OCC_PENDING * 3 + NV2A_OCC_SEG)
 typedef struct OccQuery {
-    int                   slot[OCC_QSLOTS];
-    id<MTLCommandBuffer>  cmd[OCC_QSLOTS];   /* retained */
+    int                   slot[OCC_QSLOTS];   /* its submission: s_vis_sub[slot] */
     int                   n, ovf;
     struct OccQuery      *next;              /* free list */
 } OccQuery;
@@ -6045,10 +6171,41 @@ static OccQuery         *s_qfree;
 static int               s_qmade;
 static unsigned char     s_vis_used[VIS_SLOTS];
 static int               s_vis_next;
+static uint64_t          s_vis_sub[VIS_SLOTS];   /* the submission writing it, 0: the open s_cmd */
+static int               s_vis_open[VIS_SLOTS], s_nvis_open;   /* slots the open s_cmd writes */
 static int               s_retire[VIS_SLOTS], s_nretire;
 static struct nv2a_occ   s_occ;
 static int               s_occ_mode = -1;  /* 0 defer, 1 sync, 2 fixed */
+static int               s_occ_sync;       /* inside a RECOMP_METAL_OCC=sync GET_REPORT */
 static uint64_t          s_occ_ovf;
+static uint64_t          s_occ_bad;        /* results whose submission ended in Error */
+static uint64_t          s_occ_settle_waits;   /* settles that waited for results */
+
+/* flush committed s_cmd as submission n: the slots it counts into. */
+static void occ_committed(uint64_t n)
+{
+    while (s_nvis_open)
+        s_vis_sub[s_vis_open[--s_nvis_open]] = n;
+}
+
+/* A released slot's submission is done (an Error one too): it can go. */
+static int vis_done(int i)
+{
+    return s_vis_sub[i] && sub_poll(s_vis_sub[i]) != 0;
+}
+
+/* Release, oldest first, every retired slot whose submission is done. */
+static void occ_retire(void)
+{
+    int k, j;
+    for (k = j = 0; k < s_nretire; k++) {
+        if (vis_done(s_retire[k]))
+            s_vis_used[s_retire[k]] = 0;
+        else
+            s_retire[j++] = s_retire[k];
+    }
+    s_nretire = j;
+}
 
 static int occ_mode(void)
 {
@@ -6059,17 +6216,26 @@ static int occ_mode(void)
     return s_occ_mode;
 }
 
+/* A free slot for the open s_cmd's pass; when none is, the retired ones
+ * whose submissions are done are released first. -1 if still none. */
 static int vis_alloc(void)
 {
-    int i, k;
-    for (k = 0; k < VIS_SLOTS; k++) {
-        i = (s_vis_next + k) % VIS_SLOTS;
-        if (!s_vis_used[i]) {
-            s_vis_used[i] = 1;
-            s_vis_next = (i + 1) % VIS_SLOTS;
-            ((uint64_t *)[s_vis contents])[i] = 0;
-            return i;
+    int i, k, tries;
+    for (tries = 0; tries < 2; tries++) {
+        for (k = 0; k < VIS_SLOTS; k++) {
+            i = (s_vis_next + k) % VIS_SLOTS;
+            if (!s_vis_used[i]) {
+                s_vis_used[i] = 1;
+                s_vis_next = (i + 1) % VIS_SLOTS;
+                ((uint64_t *)[s_vis contents])[i] = 0;   /* no submission writes it now */
+                s_vis_sub[i] = 0;
+                s_vis_open[s_nvis_open++] = i;
+                return i;
+            }
         }
+        if (!s_nretire)
+            break;
+        occ_retire();
     }
     return -1;
 }
@@ -6086,7 +6252,6 @@ static void occ_pass_begin(void)
         return;
     }
     q->slot[q->n] = i;
-    q->cmd[q->n] = [s_cmd retain];
     q->n++;
     [s_enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)i * 8u];
     s_occ_slot = i;
@@ -6125,12 +6290,6 @@ static void *occ_get(void *ctx)
     return q;
 }
 
-static int cmd_done(id<MTLCommandBuffer> c)
-{
-    MTLCommandBufferStatus st = [c status];
-    return st == MTLCommandBufferStatusCompleted || st == MTLCommandBufferStatusError;
-}
-
 static void occ_put(void *ctx, void *qv)
 {
     OccQuery *q = (OccQuery *)qv;
@@ -6143,11 +6302,10 @@ static void occ_put(void *ctx, void *qv)
         s_occ_q = NULL;
     }
     for (i = 0; i < q->n; i++) {
-        if (cmd_done(q->cmd[i]))
+        if (vis_done(q->slot[i]))
             s_vis_used[q->slot[i]] = 0;
         else
-            s_retire[s_nretire++] = q->slot[i];
-        [q->cmd[i] release];
+            s_retire[s_nretire++] = q->slot[i];   /* in s_cmd or in flight */
     }
     q->n = 0;
     q->next = s_qfree;
@@ -6171,26 +6329,36 @@ static void occ_end(void *ctx, void *qv)
     }
 }
 
+/* Every piece of q (a slot per pass it spans) is in once the submission
+ * writing it is done. With flush_gpu a piece still in s_cmd is committed;
+ * inside a RECOMP_METAL_OCC=sync GET_REPORT the piece's own submission is
+ * then waited for. Never polls the tracker (it calls this from its poll). */
 static int occ_result(void *ctx, void *qv, int flush_gpu, uint64_t *count)
 {
     OccQuery *q = (OccQuery *)qv;
     const uint64_t *v = (const uint64_t *)[s_vis contents];
     uint64_t sum = 0;
-    int i;
+    int i, bad = 0, r;
     (void)ctx;
     for (i = 0; i < q->n; i++) {
-        if (q->cmd[i] == s_cmd) {       /* not committed yet */
+        int s = q->slot[i];
+        if (!s_vis_sub[s]) {            /* not committed yet */
             if (!flush_gpu)
                 return 0;
             PT_WHY(PT_QUERY_READ);
             flush(0);
         }
-        if (!cmd_done(q->cmd[i]))
+        if (flush_gpu && s_occ_sync)
+            sub_wait(s_vis_sub[s], SUBW_REPORT);
+        if (!(r = sub_poll(s_vis_sub[s])))
             return 0;
+        bad |= r < 0;
     }
     for (i = 0; i < q->n; i++)
         sum += v[q->slot[i]];
-    *count = q->ovf ? NV2A_OCC_VISIBLE : sum;
+    if (bad)
+        s_occ_bad++;
+    *count = q->ovf || bad ? NV2A_OCC_VISIBLE : sum;
     return 1;
 }
 
@@ -6249,7 +6417,7 @@ static int report_in_cmd(uint32_t va)
     for (k = 0; k < p->n; k++) {
         const OccQuery *q = (const OccQuery *)p->q[k];
         for (i = 0; i < q->n; i++)
-            if (q->cmd[i] == s_cmd)
+            if (!s_vis_sub[q->slot[i]])   /* not committed yet */
                 return 1;
     }
     return 0;
@@ -6260,7 +6428,11 @@ static int metal_on_report(uint32_t va)
     if (!occ_ready_on())
         return 0;
     @autoreleasepool {
-        nv2a_occ_report(&s_occ, va, occ_mode() == 1);
+        /* sync: occ_result commits what the report still has in s_cmd and
+         * waits for exactly its slots' submissions (SUBW_REPORT). */
+        s_occ_sync = occ_mode() == 1;
+        nv2a_occ_report(&s_occ, va, s_occ_sync);
+        s_occ_sync = 0;
         /* Commit now, so the count can land within the frame, as a D3D11
          * query's does; held to the flip, it lands a frame late. Only when
          * the report counts in s_cmd: each commit ends the pass (a tile
@@ -6289,27 +6461,33 @@ static void metal_on_poll(void)
     }
 }
 
-/* After a wait every command buffer is done: retired slots free. */
+/* After a flush(1): its submission and every earlier one are done, so the
+ * retired slots go (occ_retire checks each one's own submission), and the
+ * results that are in are taken. */
 static void occ_after_wait(void)
 {
-    while (s_nretire)
-        s_vis_used[s_retire[--s_nretire]] = 0;
+    occ_retire();
     if (s_occ.ops)
         nv2a_occ_poll(&s_occ, 0);
 }
 
 /* At the end of a walk, before a semaphore release after a report, and at
  * the flip after its wait. Not in occ_after_wait, which also runs at the
- * waits inside a walk (a full ring, a readback), where the title cannot
- * read yet. */
+ * waits inside a walk (a full ring), where the title cannot read yet. Also
+ * releases the retired slots that are done, wait or no wait. */
 static void occ_settle(int flip)
 {
+    uint64_t w0;
     if (!s_occ.ops)
         return;
+    w0 = s_occ.settle_wait_us;
     if (flip)
         nv2a_occ_flip(&s_occ);
     else
         nv2a_occ_settle(&s_occ);
+    if (s_occ.settle_wait_us != w0)
+        s_occ_settle_waits++;
+    occ_retire();
 }
 
 static void flip_log(uint32_t surface_offset, RenderTarget *rt)
@@ -6769,6 +6947,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
     const uint8_t *hpx = NULL;   /* a scaled rt's host pixels (host_readback) */
     uint64_t t_flip0 = prof_on() ? prof_now() : 0, t;
     int always = wb_always(), win = 0, layer = 0, hdump = 0;
+    int rb_bad = 0;   /* rt's last write ended in Error: nothing read back */
     uint32_t cw = 0, ch = 0, hcw = 0, hch = 0;   /* the frame, guest and host */
 
     guard_open();
@@ -6806,6 +6985,17 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             occ_settle(1);
             ring_switch();   /* the frame boundary: the other ring copy */
             prof_add(&s_pa.wait, t);
+            /* The CPU reads below (host dump, host readback, write-back,
+             * readback window) need rt's last write, its sync blit
+             * included: exactly that submission (KFC-1720 H1b step 3a; the
+             * serial flush(1) above has observed it already). One that
+             * ended in Error publishes nothing: no dump, no write-back, the
+             * window keeps the image it has. */
+            if (rt && (wb || hdump || (win && !layer)) && !rt_read_ready(rt, PT_FLIP)) {
+                rb_bad = 1;
+                wb = 0;
+                hdump = 0;
+            }
             if (hdump)
                 host_dump(rt, hcw, hch);
             if (layer) {
@@ -6839,7 +7029,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             /* The host-size readback only when something reads it: the
              * write-back below or the readback-mode window. */
             t = prof_t();
-            if (rt && rt->hw != rt->w && (wb || (win && !layer)))
+            if (rt && rt->hw != rt->w && !rb_bad && (wb || (win && !layer)))
                 hpx = host_readback(rt);
             prof_add(&s_pa.hostrb, t);
             if (wb) {
@@ -6916,6 +7106,35 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_subw_blocked[SUBW_STAGE], s_subw_ns[SUBW_STAGE] / 1e6,
                 (unsigned long long)s_subw_blocked[SUBW_RING], s_subw_ns[SUBW_RING] / 1e6,
                 (unsigned long long)s_subw_blocked[SUBW_FULL], s_subw_ns[SUBW_FULL] / 1e6);
+    /* KFC-1720 H1b step 3a: visibility and CPU reads, over the last 300
+     * flips. Sync report waits: RECOMP_METAL_OCC=sync's blocked waits on a
+     * report's own submissions; settle waits: settles that spun for results
+     * within occ_settle_us; settled: answered before the result landed (the
+     * address's last count), amended: the late result written over it after. */
+    if ((stats_on || s_ring_small) && (s_presents % 300) == 0) {
+        static uint64_t p_rep, p_rep_ns, p_rd, p_rd_ns, p_skip, p_sw, p_sw_us, p_set, p_am,
+                        p_late, p_bad;
+        fprintf(stderr, LOGP "present #%llu, last 300 flips: visibility: sync report waits"
+                " %llu (%.1f ms), settle waits %llu (%.1f ms), settled before the result %llu,"
+                " amended late %llu, late as visible %llu, error results %llu; readback waits"
+                " %llu (%.1f ms), readbacks skipped on error %llu\n",
+                (unsigned long long)s_presents,
+                (unsigned long long)(s_subw_blocked[SUBW_REPORT] - p_rep),
+                (s_subw_ns[SUBW_REPORT] - p_rep_ns) / 1e6,
+                (unsigned long long)(s_occ_settle_waits - p_sw),
+                (s_occ.settle_wait_us - p_sw_us) / 1e3,
+                (unsigned long long)(s_occ.settled - p_set),
+                (unsigned long long)(s_occ.amended - p_am),
+                (unsigned long long)(s_occ.late - p_late),
+                (unsigned long long)(s_occ_bad - p_bad),
+                (unsigned long long)(s_subw_blocked[SUBW_READ] - p_rd),
+                (s_subw_ns[SUBW_READ] - p_rd_ns) / 1e6,
+                (unsigned long long)(s_rb_skipped - p_skip));
+        p_rep = s_subw_blocked[SUBW_REPORT]; p_rep_ns = s_subw_ns[SUBW_REPORT];
+        p_rd = s_subw_blocked[SUBW_READ]; p_rd_ns = s_subw_ns[SUBW_READ];
+        p_skip = s_rb_skipped; p_sw = s_occ_settle_waits; p_sw_us = s_occ.settle_wait_us;
+        p_set = s_occ.settled; p_am = s_occ.amended; p_late = s_occ.late; p_bad = s_occ_bad;
+    }
     if (stats_on && (s_presents % 300) == 0 && s_dof_skipped)
         fprintf(stderr, LOGP "dof_skip: %llu draws skipped\n", (unsigned long long)s_dof_skipped);
     if (periodic && s_rtp)
@@ -6937,6 +7156,12 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
      * SDL_UpdateTexture. It reads the texture, not the guest bytes. A surface
      * the backend never drew (guest bytes) goes as the CPU path presents it,
      * in either mode. */
+    if (rt && win && rb_bad) {
+        /* No readback (rt_read_ready): not the guest bytes either, which
+         * are an older frame; the window shows what it has. */
+        prof_flip_end(t_flip0);
+        return;
+    }
     if (rt && hpx && win) {
         /* Scaled: the frame's part of the host-size readback above. */
         t = prof_t();
@@ -7168,6 +7393,7 @@ static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
     s_tick++;
     dst->last_use = s_tick;
     dst->dirty = 1;   /* the copy is on the GPU only: an eviction writes it back */
+    dst->wpend = 1;   /* s_cmd's number is its last write */
     dst->zseq = ++s_zseq;
     dt_mem_written(dst->addr, dst->pitch * dst->h, dst->zseq);   /* zt_find */
     dst->copy = 1;
