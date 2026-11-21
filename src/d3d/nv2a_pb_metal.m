@@ -248,6 +248,23 @@ static NSUInteger    s_vb_size, s_vb_pos, s_ib_size, s_ib_pos;
 static uint64_t      s_ring_switches, s_ring_cuts, s_ring_oversize;
 static int           s_ring_small;   /* RECOMP_DEBUG=metal_ring_small is set */
 
+/* RECOMP_DEBUG=metal_inflight=1|2 (KFC-1720 H1b step 4), read at init. 1, the
+ * default: the flip commits the frame's command buffer and waits for it, as
+ * before. 2: the flip commits it without waiting, and the CPU builds frame
+ * N+1 while the GPU runs N. The bound is one frame back (flip_bound): at the
+ * end of flip N the CPU waits for flip N-1's last submission (SUBW_FRAME)
+ * before it goes on to N+1, so N+1 is built while at most N runs, whether or
+ * not N+1 draws (the ring guard alone binds only frames that draw).
+ * s_flip_sub: each flip's last submission, by flip count mod 4 (0 none).
+ * s_ifl_*: frames with work committed and not done at the end of each flip,
+ * before that wait, over the last 300 flips (2 at most; 3 is the bound
+ * failing). s_occ_flip_early: reports the flip settled without the spin. */
+static int      s_inflight = 1;
+static uint64_t s_flip_sub[4];
+static uint64_t s_ifl_sum, s_ifl_n, s_ifl_hist[4];
+static int      s_ifl_max;
+static uint64_t s_occ_flip_early;
+
 #define VIS_SLOTS 8192
 
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped, s_draws_prog,
@@ -361,6 +378,7 @@ static int s_occ_slot = -1;          /* its slot on s_enc */
  * (mag_committed); render targets are numbered in flush itself. */
 static void occ_committed(uint64_t n);
 static void mag_committed(uint64_t n);
+static void cap_committed(uint64_t n);   /* metal_capture_at (step 4) */
 
 /* RECOMP_TRACE=metal_prof: where on_flip's time goes, averaged over 300
  * flips: the wait for the frame's last command buffer, the GPU time of every
@@ -1568,9 +1586,12 @@ static _Atomic uint64_t s_sub_errs;   /* ended in Error, counted by the handler 
  * RECOMP_METAL_OCC=sync (step 3a), a CPU read of a render target's bytes
  * (step 3a); CPU writes (step 3b): rt_seed's fill of s_rtp_buf, the debug
  * draws' s_dbg_vb, a frame uploaded into a presenter slot, the tex_mag
- * trace's read and zeroing of a frame's buffer. */
+ * trace's read and zeroing of a frame's buffer; step 4: a ring copy's first
+ * write after the flip (the ring guard, SUBW_GUARD; SUBW_RING keeps the ring
+ * cuts and flush(1)'s own "every earlier one"), metal_inflight=2's wait one
+ * frame back at the end of each flip (SUBW_FRAME). */
 enum { SUBW_FLUSH, SUBW_STAGE, SUBW_RING, SUBW_FULL, SUBW_REPORT, SUBW_READ,
-       SUBW_RTP, SUBW_DBG, SUBW_SLOT, SUBW_MAG, SUBW_N };
+       SUBW_RTP, SUBW_DBG, SUBW_SLOT, SUBW_MAG, SUBW_GUARD, SUBW_FRAME, SUBW_N };
 static uint64_t s_subw_blocked[SUBW_N], s_subw_ns[SUBW_N];
 static uint64_t s_rb_skipped;   /* CPU reads skipped: the write's submission ended in Error */
 
@@ -1760,6 +1781,7 @@ static void flush(int wait)
     }
     occ_committed(n);
     mag_committed(n);
+    cap_committed(n);
     if (flipping && s_gb_on > 0 && s_scene_close_ns) {
         double ms = (prof_now() - s_scene_close_ns) / 1e6;
         s_pts.cpu_n++;
@@ -1918,6 +1940,10 @@ static int init(void)
         if (s_rtp)
             fprintf(stderr, LOGP "metal_rt_private=1: color render targets in Private storage,"
                     " CPU reads/writes through a staging blit\n");
+        s_inflight = recomp_env_int(RENV_METAL_INFLIGHT, 1) >= 2 ? 2 : 1;
+        if (s_inflight > 1)
+            fprintf(stderr, LOGP "metal_inflight=2: the flip commits the frame without waiting;"
+                    " at the end of flip N the CPU waits for flip N-1's work\n");
         /* Every Mac GPU samples BC; an iPad before the A-series GPUs that
          * report it does not, and its pack BC3 entries go up from the guest. */
 #if TARGET_OS_OSX
@@ -2717,9 +2743,11 @@ static int ring_reserve(NSUInteger vbytes, NSUInteger ibytes, float **vf, NSUInt
         return 0;
     }
     if (s_ring_guard) {
-        /* the copy's first write since the flip: whatever read it last is done */
+        /* the copy's first write since the flip: whatever read it last is
+         * done (with metal_inflight=2 the flip's flip_bound has waited for
+         * the frame that bound it: this blocks only if that one did not) */
         s_ring_guard = 0;
-        sub_wait_upto(s_ring[s_ring_cur].last_sub, SUBW_RING);
+        sub_wait_upto(s_ring[s_ring_cur].last_sub, SUBW_GUARD);
     }
     va = (s_vb_pos + 15u) & ~(NSUInteger)15u;
     ia = (s_ib_pos + 15u) & ~(NSUInteger)15u;
@@ -2739,9 +2767,11 @@ static int ring_reserve(NSUInteger vbytes, NSUInteger ibytes, float **vf, NSUInt
     return 1;
 }
 
-/* At the flip, after its wait: the other copy becomes the active one, from
- * its start; its first write waits for its last submission (in serial mode
- * long done). Then the completions so far are observed. */
+/* At the flip, after its commit (and wait, metal_inflight=1): the other copy
+ * becomes the active one, from its start; its first write waits for its last
+ * submission, the frame before the one just committed (serial: long done;
+ * metal_inflight=2: done by flip_bound at the end of this flip). Then the
+ * completions so far are observed. */
 static void ring_switch(void)
 {
     s_ring_cur = (s_ring_cur + 1) % RING_COPIES;
@@ -6650,7 +6680,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
 static void prof_flip_end(uint64_t t_flip0)
 {
     static uint64_t p_wb, p_ds, p_pa;
-    int i;
+    int i, j, done = 0;
     uint64_t g0;
     if (!prof_on()) {
         if (pt_on())
@@ -6658,14 +6688,22 @@ static void prof_flip_end(uint64_t t_flip0)
         return;
     }
     g0 = s_pa.gpu;
-    for (i = 0; i < s_prof_ncmd; i++) {
+    /* One still running (metal_inflight=2's frame, the layer's slot copy)
+     * stays for a later flip, which adds its GPU time: never a wait. */
+    for (i = j = 0; i < s_prof_ncmd; i++) {
         id<MTLCommandBuffer> c = s_prof_cmd[i];
-        if ([c status] == MTLCommandBufferStatusCompleted) {
+        MTLCommandBufferStatus st = [c status];
+        if (st < MTLCommandBufferStatusCompleted) {
+            s_prof_cmd[j++] = c;
+            continue;
+        }
+        if (st == MTLCommandBufferStatusCompleted) {
             CFTimeInterval a = [c GPUStartTime], b = [c GPUEndTime];
             if (b > a)
                 s_pa.gpu += (uint64_t)((b - a) * 1e9);
         }
         [c release];
+        done++;
     }
     s_pa_ez_gpu[s_prof_ez ? 1 : 0] += s_pa.gpu - g0;
     s_pa_ez_n[s_prof_ez ? 1 : 0]++;
@@ -6673,8 +6711,8 @@ static void prof_flip_end(uint64_t t_flip0)
         s_pts.cmd_ns += s_pa.gpu - g0;   /* metal_gpu_blocks' total to compare */
         pt_flip();
     }
-    s_pa.ncmd += (uint64_t)s_prof_ncmd;
-    s_prof_ncmd = 0;
+    s_pa.ncmd += (uint64_t)done;
+    s_prof_ncmd = j;
     s_pa.flip += prof_now() - t_flip0;
     if (++s_pa.n == 300) {
         double n = (double)s_pa.n;
@@ -6719,38 +6757,195 @@ static int host_dump_due(void)
     return prefix && ((s_presents + 1) % (uint64_t)every) == 0;
 }
 
-static void host_dump(RenderTarget *rt, uint32_t hcw, uint32_t hch)
+/* w x h BGRA8 pixels, rows `stride` bytes apart, into a 24-bit bottom-up
+ * BMP at path: host_dump's writer, and metal_capture_at's, so the same pixels
+ * give the same file. 0 when the file cannot be opened. */
+static int bmp_write(const char *path, const uint8_t *px, size_t stride, uint32_t w,
+                     uint32_t h)
 {
-    const uint8_t *px = host_readback(rt);
-    char path[1024];
     uint8_t hdr[54];
-    uint32_t row = hcw * 3u, padb = (4u - (row & 3u)) & 3u, size, y, x;
-    FILE *f;
+    uint32_t row = w * 3u, padb = (4u - (row & 3u)) & 3u, size, y, x;
+    FILE *f = fopen(path, "wb");
 
-    if (!px || !hcw || !hch)
-        return;
-    snprintf(path, sizeof path, "%shost_%05llu.bmp", recomp_env(RENV_METAL_HOST_DUMP),
-             (unsigned long long)(s_presents + 1));
-    f = fopen(path, "wb");
     if (!f)
-        return;
-    size = 54u + (row + padb) * hch;
+        return 0;
+    size = 54u + (row + padb) * h;
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 'B'; hdr[1] = 'M';
     memcpy(hdr + 2, &size, 4);
     hdr[10] = 54; hdr[14] = 40;
-    memcpy(hdr + 18, &hcw, 4);
-    memcpy(hdr + 22, &hch, 4);
+    memcpy(hdr + 18, &w, 4);
+    memcpy(hdr + 22, &h, 4);
     hdr[26] = 1; hdr[28] = 24;
     fwrite(hdr, 1, sizeof hdr, f);
-    for (y = hch; y-- > 0; ) {
-        const uint8_t *s = px + (size_t)y * rt->hw * 4u;
-        for (x = 0; x < hcw; x++)
+    for (y = h; y-- > 0; ) {
+        const uint8_t *s = px + (size_t)y * stride;
+        for (x = 0; x < w; x++)
             fwrite(s + (size_t)x * 4u, 1, 3, f);
         if (padb)
             fwrite(hdr + 1, 1, padb, f);   /* zero bytes of the header */
     }
     fclose(f);
+    return 1;
+}
+
+static void host_dump(RenderTarget *rt, uint32_t hcw, uint32_t hch)
+{
+    const uint8_t *px = host_readback(rt);
+    char path[1024];
+
+    if (!px || !hcw || !hch)
+        return;
+    snprintf(path, sizeof path, "%shost_%05llu.bmp", recomp_env(RENV_METAL_HOST_DUMP),
+             (unsigned long long)(s_presents + 1));
+    (void)bmp_write(path, px, (size_t)rt->hw * 4u, hcw, hch);
+}
+
+/* RECOMP_DEBUG=metal_capture_at=<flip>[,<flip>...][,<prefix>] (KFC-1720 H1b
+ * step 4, the image check without a forced wait): the presented target of
+ * each listed flip, hcw x hch from its top left as host_dump writes it, is
+ * copied on the GPU into a Shared buffer of its own inside the frame's own
+ * command buffer, after the debug draw and the readback sync, just before
+ * the flip's commit (cap_encode); nothing waits for it. A later flip that
+ * sees its submission done (sub_poll, cap_poll) writes it to
+ * <prefix>cap-NNNNN.bmp with host_dump's writer, so metal_inflight=1 and =2
+ * captures of one flip compare byte for byte (and with host_dump's
+ * host_NNNNN.bmp of that flip). NNNNN is the flip as host_dump numbers it,
+ * s_presents + 1 while the frame is built. Items are separated by ',' (the key is
+ * in recomp_env.c's s_comma_keys) or ':'; the first item that does not start with a
+ * digit is the prefix, the rest of the value (default: metal_host_dump's,
+ * else fb_dump's, else none: the working directory). Up to CAP_AT_MAX flips;
+ * CAP_PEND captures on the GPU at once, past that one is skipped and logged.
+ * One whose submission ended in Error is not written. Captures still on the
+ * GPU at exit are not written. */
+#define CAP_AT_MAX 32
+#define CAP_PEND   4
+static struct {
+    int         n;              /* -1: not read yet */
+    uint64_t    at[CAP_AT_MAX];
+    const char *prefix;
+} s_capat = { -1, {0}, NULL };
+static struct {
+    id<MTLBuffer> buf;          /* nil: free */
+    uint64_t      flip, sub;    /* sub: 0 while in the open s_cmd */
+    int           pend;         /* in the open s_cmd: flush numbers it */
+    uint32_t      w, h;
+} s_capq[CAP_PEND];
+static uint64_t s_cap_written, s_cap_skipped;
+
+static void cap_parse(void)
+{
+    const char *e = recomp_env(RENV_METAL_CAPTURE_AT);
+    s_capat.n = 0;
+    while (e && *e) {
+        char *end;
+        unsigned long long v;
+        if (*e < '0' || *e > '9') {
+            s_capat.prefix = e;
+            break;
+        }
+        v = strtoull(e, &end, 10);
+        if (s_capat.n < CAP_AT_MAX)
+            s_capat.at[s_capat.n++] = (uint64_t)v;
+        if (*end != ',' && *end != ':')
+            break;
+        e = end + 1;
+    }
+    if (!s_capat.prefix)
+        s_capat.prefix = recomp_env(RENV_METAL_HOST_DUMP);
+    if (!s_capat.prefix)
+        s_capat.prefix = recomp_env(RENV_FB_DUMP);
+    if (!s_capat.prefix)
+        s_capat.prefix = "";
+    if (s_capat.n)
+        fprintf(stderr, LOGP "metal_capture_at: %d flips, first %llu, into %scap-NNNNN.bmp\n",
+                s_capat.n, (unsigned long long)s_capat.at[0], s_capat.prefix);
+}
+
+/* flush committed s_cmd as submission n: the captures it copies into. */
+static void cap_committed(uint64_t n)
+{
+    int k;
+    for (k = 0; k < CAP_PEND; k++)
+        if (s_capq[k].buf && s_capq[k].pend) {
+            s_capq[k].sub = n;
+            s_capq[k].pend = 0;
+        }
+}
+
+/* At the flip, before its commit: rt's presented part into a fresh Shared
+ * buffer, in the open s_cmd, when this flip is listed. */
+static void cap_encode(RenderTarget *rt, uint32_t hcw, uint32_t hch)
+{
+    uint64_t flip = s_presents + 1;
+    id<MTLBlitCommandEncoder> b;
+    int i, k;
+
+    if (s_capat.n < 0)
+        cap_parse();
+    for (i = 0; i < s_capat.n && s_capat.at[i] != flip; i++)
+        ;
+    if (i == s_capat.n || !rt->tex || !hcw || !hch)
+        return;
+    for (k = 0; k < CAP_PEND && s_capq[k].buf; k++)
+        ;
+    if (k == CAP_PEND) {
+        s_cap_skipped++;
+        fprintf(stderr, LOGP "metal_capture_at: flip %llu skipped, %d captures still on the"
+                " GPU\n", (unsigned long long)flip, CAP_PEND);
+        return;
+    }
+    s_capq[k].buf = [s_dev newBufferWithLength:(NSUInteger)hcw * hch * 4u
+                                       options:MTLResourceStorageModeShared];
+    if (!s_capq[k].buf) {
+        s_cap_skipped++;
+        fprintf(stderr, LOGP "metal_capture_at: flip %llu skipped, no %ux%u buffer\n",
+                (unsigned long long)flip, hcw, hch);
+        return;
+    }
+    end_encoder();   /* the flip's reason (metal_passes), set by the caller */
+    ensure_cmd();
+    b = pt_on() ? pt_blit(PT_FLIP, NV2A_GCAT_OTHER) : [s_cmd blitCommandEncoder];
+    [b copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0
+          sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(hcw, hch, 1)
+              toBuffer:s_capq[k].buf destinationOffset:0
+    destinationBytesPerRow:(NSUInteger)hcw * 4u
+  destinationBytesPerImage:(NSUInteger)hcw * 4u * hch];
+    [b endEncoding];
+    rt_read_mark(rt);   /* a GPU read of rt (use_sub) */
+    s_capq[k].flip = flip;
+    s_capq[k].sub = 0;
+    s_capq[k].pend = 1;
+    s_capq[k].w = hcw;
+    s_capq[k].h = hch;
+}
+
+/* Each flip: the captures whose submission is done are written, never
+ * waited for. */
+static void cap_poll(void)
+{
+    int k, r = 0;
+    for (k = 0; k < CAP_PEND; k++) {
+        char path[1024];
+        if (!s_capq[k].buf || s_capq[k].pend || !(r = sub_poll(s_capq[k].sub)))
+            continue;
+        snprintf(path, sizeof path, "%scap-%05llu.bmp", s_capat.prefix,
+                 (unsigned long long)s_capq[k].flip);
+        if (r < 0)
+            fprintf(stderr, LOGP "metal_capture_at: flip %llu not written, its submission"
+                    " %llu ended in error\n", (unsigned long long)s_capq[k].flip,
+                    (unsigned long long)s_capq[k].sub);
+        else if (bmp_write(path, (const uint8_t *)[s_capq[k].buf contents],
+                           (size_t)s_capq[k].w * 4u, s_capq[k].w, s_capq[k].h)) {
+            s_cap_written++;
+            fprintf(stderr, LOGP "metal_capture_at: flip %llu (%ux%u) -> %s, written at flip"
+                    " %llu\n", (unsigned long long)s_capq[k].flip, s_capq[k].w, s_capq[k].h,
+                    path, (unsigned long long)(s_presents + 1));
+        } else
+            fprintf(stderr, LOGP "metal_capture_at: cannot open %s\n", path);
+        [s_capq[k].buf release];
+        s_capq[k].buf = nil;
+    }
 }
 
 #ifdef XBOXRECOMP_ENHANCE
@@ -7026,6 +7221,39 @@ static void gpu_spin_flip(void)
     last = [cb retain];
 }
 
+/* The end of each flip's GPU work, before s_presents moves on (KFC-1720 H1b
+ * step 4): the flip's last submission noted (s_flip_sub), the frames with
+ * work committed and not done counted (s_ifl_*: this one and the one before
+ * at most), then, with metal_inflight=2, the wait one frame back: flip N-1's
+ * last submission (its slot copy included), SUBW_FRAME. After it N+1 is
+ * built while only N runs: its ring copy (N-1's), the pass tracer's frame
+ * table and timestamp buffer by flip parity (pt_flip judges N-1, gb_resolve
+ * reads it), the debug draws' buffer and every other last use from N-1 are
+ * done. metal_inflight=1 only notes the submission. */
+static void flip_bound(void)
+{
+    uint64_t f = s_presents;   /* this flip, before s_presents++ */
+    uint64_t k;
+    int busy = 0;
+
+    s_flip_sub[f % 4] = s_sub_last;
+    if (s_inflight < 2)
+        return;
+    /* flips N-2, N-1, N: one with a submission of its own still running */
+    for (k = f >= 2 ? f - 2 : 0; k <= f; k++) {
+        uint64_t v = s_flip_sub[k % 4], pv = k ? s_flip_sub[(k + 3) % 4] : 0;
+        if (v > pv && !sub_done_upto(v))
+            busy++;
+    }
+    s_ifl_sum += (uint64_t)busy;
+    s_ifl_n++;
+    s_ifl_hist[busy]++;
+    if (busy > s_ifl_max)
+        s_ifl_max = busy;
+    if (f)
+        sub_wait_upto(s_flip_sub[(f + 3) % 4], SUBW_FRAME);
+}
+
 static void metal_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
@@ -7065,16 +7293,35 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             PT_WHY(PT_FLIP);
             if (rt && (wb || hdump || (win && !layer)))
                 rt_managed_sync(rt);
+            if (rt) {
+                /* RECOMP_DEBUG=metal_capture_at: in this command buffer */
+                PT_WHY(PT_FLIP);
+                cap_encode(rt, hcw, hch);
+            }
             t = prof_t();
             PT_WHY(PT_FLIP);
-            flush(1);
-            occ_settle(1);
+            /* metal_inflight=2 (KFC-1720 H1b step 4): the frame is committed
+             * and not waited for; flip_bound below waits one frame back. */
+            flush(s_inflight < 2);
+            if (s_inflight > 1 && s_occ.ops) {
+                /* This frame's results are not in: the flip settles without
+                 * the spin (occ_settle_us), from the last counts, and the
+                 * results amend them as they land (a frame late). */
+                uint64_t us = s_occ.settle_us, set = s_occ.settled;
+                s_occ.settle_us = 0;
+                occ_settle(1);
+                s_occ.settle_us = us;
+                s_occ_flip_early += s_occ.settled - set;
+            } else {
+                occ_settle(1);
+            }
             ring_switch();   /* the frame boundary: the other ring copy */
             prof_add(&s_pa.wait, t);
             /* The CPU reads below (host dump, host readback, write-back,
              * readback window) need rt's last write, its sync blit
              * included: exactly that submission (KFC-1720 H1b step 3a; the
-             * serial flush(1) above has observed it already). One that
+             * serial flush(1) above has observed it already, with
+             * metal_inflight=2 it is waited for here). One that
              * ended in Error publishes nothing: no dump, no write-back, the
              * window keeps the image it has. */
             if (rt && (wb || hdump || (win && !layer)) && !rt_read_ready(rt, PT_FLIP)) {
@@ -7135,6 +7382,12 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 if (addr == rt->addr && pitch == rt->pitch)
                     rt_own_reset(rt);
             }
+            /* metal_inflight=2: the wait one frame back (metal_prof: the
+             * flip's wait, as flush(1)'s is with metal_inflight=1) */
+            t = prof_t();
+            flip_bound();
+            prof_add(&s_pa.wait, t);
+            cap_poll();   /* RECOMP_DEBUG=metal_capture_at: the ones done */
             /* after the flip's own GPU work (present blit, readbacks) */
             gpu_spin_flip();   /* RECOMP_DEBUG=metal_gpu_spin; off: returns */
         }
@@ -7185,11 +7438,18 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
                 " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
                 (unsigned long long)s_blits_guest);
-    /* KFC-1720 H1b step 2: submissions, ring copies and waits, running totals */
-    if ((stats_on || s_ring_small) && (s_presents % 300) == 0)
+    /* KFC-1720 H1b step 2: submissions, ring copies and waits, running totals.
+     * Step 4: the back-pressure, ring guard and frame bound (running totals),
+     * and metal_inflight=2's frames in flight at the end of each flip over
+     * the last 300 flips (max, mean, how many flips saw 0 / 1 / 2 / 3). */
+    if ((stats_on || s_ring_small || s_inflight > 1) && (s_presents % 300) == 0) {
         fprintf(stderr, LOGP "present #%llu: %llu submissions (%llu errors), %llu ring switches,"
                 " %llu ring cuts, %llu oversize draws; blocked waits: flush %llu (%.1f ms),"
-                " seed %llu (%.1f ms), ring %llu (%.1f ms), table full %llu (%.1f ms)\n",
+                " seed %llu (%.1f ms), ring %llu (%.1f ms), table full %llu (%.1f ms),"
+                " ring guard %llu (%.1f ms), frame bound %llu (%.1f ms); metal_inflight=%d,"
+                " last 300 flips: frames in flight at the flip max %d mean %.2f"
+                " (0/1/2/3: %llu/%llu/%llu/%llu), reports the flip settled early %llu;"
+                " captures written %llu, skipped %llu\n",
                 (unsigned long long)s_presents, (unsigned long long)s_sub_last,
                 (unsigned long long)atomic_load_explicit(&s_sub_errs, memory_order_relaxed),
                 (unsigned long long)s_ring_switches, (unsigned long long)s_ring_cuts,
@@ -7197,7 +7457,19 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_subw_blocked[SUBW_FLUSH], s_subw_ns[SUBW_FLUSH] / 1e6,
                 (unsigned long long)s_subw_blocked[SUBW_STAGE], s_subw_ns[SUBW_STAGE] / 1e6,
                 (unsigned long long)s_subw_blocked[SUBW_RING], s_subw_ns[SUBW_RING] / 1e6,
-                (unsigned long long)s_subw_blocked[SUBW_FULL], s_subw_ns[SUBW_FULL] / 1e6);
+                (unsigned long long)s_subw_blocked[SUBW_FULL], s_subw_ns[SUBW_FULL] / 1e6,
+                (unsigned long long)s_subw_blocked[SUBW_GUARD], s_subw_ns[SUBW_GUARD] / 1e6,
+                (unsigned long long)s_subw_blocked[SUBW_FRAME], s_subw_ns[SUBW_FRAME] / 1e6,
+                s_inflight, s_ifl_max, s_ifl_n ? (double)s_ifl_sum / (double)s_ifl_n : 0.0,
+                (unsigned long long)s_ifl_hist[0], (unsigned long long)s_ifl_hist[1],
+                (unsigned long long)s_ifl_hist[2], (unsigned long long)s_ifl_hist[3],
+                (unsigned long long)s_occ_flip_early,
+                (unsigned long long)s_cap_written, (unsigned long long)s_cap_skipped);
+        s_ifl_sum = s_ifl_n = 0;
+        s_ifl_max = 0;
+        memset(s_ifl_hist, 0, sizeof s_ifl_hist);
+        s_occ_flip_early = 0;
+    }
     /* KFC-1720 H1b step 3a: visibility and CPU reads, over the last 300
      * flips. Sync report waits: RECOMP_METAL_OCC=sync's blocked waits on a
      * report's own submissions; settle waits: settles that spun for results
