@@ -833,7 +833,11 @@ double fbm_now(void)
  * a frame is on screen); the interval is between consecutive new images'
  * presentedTime. The GPU time is the whole present command buffer's
  * (GPUEndTime - GPUStartTime): MetalFX, the shader chain and a shot blit
- * included when they run. */
+ * included when they run. The age split (KFC-2115, hub 20-nov), p50/p95 of
+ * each new image's age in five parts on the same clock: pickup, publish to
+ * fbm_present's entry (the SDL main loop's turn); drawable, nextDrawable's
+ * wait; encode, to the commit; gpu, the commit to the present pass's
+ * GPUEndTime; display, GPUEndTime to presentedTime. */
 #define PACE_RECS 64
 #define PACE_SAMPLES 4096
 static struct pace_rec {
@@ -841,6 +845,8 @@ static struct pace_rec {
     double pub;
     double shown;               /* the presented handler's */
     double gpu;                 /* the completed handler's */
+    double t_in, t_drw, t_cmt;  /* fbm_present's entry, nextDrawable back, commit */
+    double gend;                /* the completed handler's GPUEndTime */
     int shown_done, gpu_done;   /* atomics: the handlers' release stores */
 } s_pr[PACE_RECS];
 static uint64_t s_pr_head, s_pr_tail;  /* main only: oldest live, next to claim */
@@ -851,8 +857,9 @@ static struct pace_win {        /* main only: the line being gathered */
     double t0;
     unsigned shown, fresh, repeat, dropped, untracked;
     uint64_t skipped;
-    unsigned ni, na, ng;
+    unsigned ni, na, ng, nq;
     float iv[PACE_SAMPLES], age[PACE_SAMPLES], gpu[PACE_SAMPLES];
+    float split[5][PACE_SAMPLES];   /* nq each: the age split */
 } s_pw;
 
 static int pace_cmp(const void *a, const void *b)
@@ -905,6 +912,16 @@ static void pace_print(void)
             pace_pct(s_pw.gpu, s_pw.ng, 0.95, 2, f, sizeof f));
     if (s_pw.untracked)
         fprintf(stderr, " untracked %u", s_pw.untracked);
+    if (s_pw.nq) {
+        static const char *const nm[5] = { "pickup", "drawable", "encode", "gpu", "display" };
+        fprintf(stderr, " \xc2\xb7 age split p50/p95 ms:");
+        for (i = 0; i < 5; i++) {
+            qsort(s_pw.split[i], s_pw.nq, sizeof s_pw.split[i][0], pace_cmp);
+            fprintf(stderr, " %s %s/%s", nm[i],
+                    pace_pct(s_pw.split[i], s_pw.nq, 0.50, 1, a, sizeof a),
+                    pace_pct(s_pw.split[i], s_pw.nq, 0.95, 1, b, sizeof b));
+        }
+    }
     fputc('\n', stderr);
     /* The counters; the samples are overwritten, not read past the counts. */
     memset(&s_pw, 0, offsetof(struct pace_win, iv));
@@ -931,6 +948,13 @@ static void pace_drain(void)
             s_pw.fresh++;
             if (s_pw.na < PACE_SAMPLES)
                 s_pw.age[s_pw.na++] = (float)((r->shown - r->pub) * 1e3);
+            if (r->gend > 0 && s_pw.nq < PACE_SAMPLES) {
+                double t[6] = { r->pub, r->t_in, r->t_drw, r->t_cmt, r->gend, r->shown };
+                int i;
+                for (i = 0; i < 5; i++)
+                    s_pw.split[i][s_pw.nq] = (float)((t[i + 1] - t[i]) * 1e3);
+                s_pw.nq++;
+            }
             if (s_pc_last_new > 0 && s_pw.ni < PACE_SAMPLES)
                 s_pw.iv[s_pw.ni++] = (float)((r->shown - s_pc_last_new) * 1e3);
             s_pc_last_new = r->shown;
@@ -967,7 +991,7 @@ static struct pace_rec *pace_claim(const struct fbm_pace_frame *pf)
     r->seq = pf->seq;
     r->pub = pf->pub;
     r->skip = skip;
-    r->shown = r->gpu = 0;
+    r->shown = r->gpu = r->gend = 0;
     __atomic_store_n(&r->shown_done, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&r->gpu_done, 0, __ATOMIC_RELAXED);
     return r;
@@ -988,6 +1012,7 @@ static void pace_handlers(struct pace_rec *r, id<CAMetalDrawable> d, id<MTLComma
     [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
         CFTimeInterval a = [c GPUStartTime], b = [c GPUEndTime];
         r->gpu = b > a ? b - a : 0;
+        r->gend = b;
         __atomic_store_n(&r->gpu_done, 1, __ATOMIC_RELEASE);
     }];
 }
@@ -998,6 +1023,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 const struct fbm_pace_frame *pace)
 {
     int ok = 0;
+    double t_in = pace ? CACurrentMediaTime() : 0, t_drw = 0;   /* the age split */
 
     @autoreleasepool {
         id<CAMetalDrawable> d;
@@ -1069,6 +1095,8 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         d = [s_layer nextDrawable];
         if (!d)
             return 0;
+        if (pace)
+            t_drw = CACurrentMediaTime();
         dw = (int)[d.texture width];
         dh = (int)[d.texture height];
         {   /* the pixels the frame really goes out at, once and on each change */
@@ -1273,8 +1301,12 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 [b endEncoding];
             }
         }
-        if (pace && (pr = pace_claim(pace)))
+        if (pace && (pr = pace_claim(pace))) {
+            pr->t_in = t_in;
+            pr->t_drw = t_drw;
+            pr->t_cmt = CACurrentMediaTime();
             pace_handlers(pr, d, cb);   /* before presentDrawable and the commit */
+        }
         [cb presentDrawable:d];
         [cb commit];
         [s_slot_cb[k] release];
