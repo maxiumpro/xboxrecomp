@@ -1466,6 +1466,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* stop_signals(0) put the old disposition back: the stop it was. */
         fprintf(stderr, "[PRESENT] signal %d: window closed first, stopping\n", (int)s_stop);
         fflush(stderr);
+        /* raise() ends the run without atexit: the exit-time reports first
+         * (RECOMP_TRACE=prof's report, KFC-2115: a SIGTERM lost one) */
+        recomp_exit_hook_run("signal");
         raise(s_stop);
     }
 #endif
