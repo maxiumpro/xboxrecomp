@@ -1298,7 +1298,7 @@ static int qdrain_hold(int k, uint32_t flip, uint32_t fw, const char *shot_path,
 }
 
 /* A present's nextDrawable wait (seconds), after the drawable came back. */
-static void qdrain_sample(double wait, int k, uint32_t flip, double now)
+static void qdrain_sample(double wait_s, int k, uint32_t flip, double now)
 {
     static float sorted[QDRAIN_MAX];
     double p50;
@@ -1307,7 +1307,7 @@ static void qdrain_sample(double wait, int k, uint32_t flip, double now)
     s_qd_pflip = flip;
     if (s_qd.state)
         return;     /* armed: the window starts again after the drain */
-    s_qd.wait[s_qd.pos] = (float)(wait * 1e3);
+    s_qd.wait[s_qd.pos] = (float)(wait_s * 1e3);
     s_qd.pos = (s_qd.pos + 1) % s_qd.n;
     if (s_qd.fill < s_qd.n)
         s_qd.fill++;
