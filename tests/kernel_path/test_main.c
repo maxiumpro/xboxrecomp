@@ -1442,6 +1442,41 @@ static void set_data_home(const char *v)
 #endif
 }
 
+/* RECOMP_DEBUG=file_alias=<from>:<to>: a last component <from>, in any case,
+ * opens <to> in the same folder; nothing else changes, and unset it is off. */
+static void test_file_alias(void)
+{
+    char a[1200], b[1200];
+
+    printf("file_alias\n");
+    recomp_env_set(RENV_SAVE_DIR, "");
+    xbox_path_init(g_game, g_save);
+
+    snprintf(a, sizeof a, "%s" SEP "scifi.level", g_game);
+    snprintf(b, sizeof b, "%s" SEP "forest.level", g_game);
+    recomp_env_set(RENV_FILE_ALIAS, NULL);
+    expect("d:\\scifi.level", a, "file_alias unset: scifi.level is itself");
+
+    recomp_env_set(RENV_FILE_ALIAS, "scifi.level:forest.level");
+    expect("d:\\scifi.level", b, "file_alias: d:\\scifi.level opens forest.level");
+    expect("D:\\SciFi.LEVEL", b, "file_alias: the name matches in any case");
+    expect("\\Device\\CdRom0\\scifi.level", b, "file_alias: through the CdRom0 device too");
+    snprintf(a, sizeof a, "%s" SEP "levels" SEP "forest.level", g_game);
+    expect("d:\\levels/scifi.level", a, "file_alias: after a '/', same folder");
+    snprintf(a, sizeof a, "%s" SEP "xscifi.level", g_game);
+    expect("d:\\xscifi.level", a, "file_alias: a longer name is not aliased");
+    snprintf(a, sizeof a, "%s" SEP "scifi.level.bak", g_game);
+    expect("d:\\scifi.level.bak", a, "file_alias: nor a name it only starts");
+    snprintf(a, sizeof a, "%s" SEP "scifi.level" SEP "x.bin", g_game);
+    expect("d:\\scifi.level\\x.bin", a, "file_alias: only the last component");
+
+    recomp_env_set(RENV_FILE_ALIAS, "scifi.level");
+    snprintf(a, sizeof a, "%s" SEP "scifi.level", g_game);
+    expect("d:\\scifi.level", a, "file_alias: a value without ':' does nothing");
+    recomp_env_set(RENV_FILE_ALIAS, NULL);
+    expect("d:\\scifi.level", a, "file_alias reset: scifi.level is itself again");
+}
+
 /* The default root with no save dir from the game: one per title id, under
  * $XDG_DATA_HOME or %LOCALAPPDATA%. */
 static void test_title_default(void)
@@ -1541,6 +1576,7 @@ int main(int argc, char **argv)
     make_dir(g_game);
 
     test_default_root();
+    test_file_alias();
     test_save_dir_root();
     test_case_fallback();
     test_legacy_saves();

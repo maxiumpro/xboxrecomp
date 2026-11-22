@@ -120,6 +120,15 @@ static struct qdrain {
     uint32_t flip;
     double since;            /* held: the first present call not made */
 } s_qd;
+/* RECOMP_DEBUG=metal_stall=<ms> (test hook for metal_drain): an induced
+ * hitch, main thread only, its keys read once in fbm_create. ms is 0 while
+ * it is off: fbm_present then takes no time stamp for it. See stall_due. */
+static struct mstall {
+    double ms;               /* the sleep; 0: off */
+    double every;            /* seconds between two */
+    double next;             /* the next one is due (CACurrentMediaTime) */
+    unsigned count;          /* stalls so far, for #k */
+} s_ms;
 #ifdef XBOXRECOMP_ENHANCE
 static id<MTLRenderPipelineState>  s_pso_lines; /* present.shader: guest-line resolve */
 static id<MTLRenderPipelineState>  s_pso_ovl;  /* the overlay, premultiplied */
@@ -306,6 +315,28 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             fprintf(stderr, "[PRESENT] metal_drain: on, the median nextDrawable wait over %u"
                     " presents > %.1f ms skips 1 present, at least %.1f s apart\n",
                     s_qd.n, s_qd.ms, s_qd.gap);
+        }
+        /* RECOMP_DEBUG=metal_stall=<ms>: read once, here; after_s counts
+         * from this point (the window layer made, about the launch) */
+        if (recomp_env(RENV_METAL_STALL)) {
+            double sms = recomp_env_double(RENV_METAL_STALL, 0);
+            double sev = recomp_env_double(RENV_METAL_STALL_EVERY_S, 20.0);
+            double saf = recomp_env_double(RENV_METAL_STALL_AFTER_S, 90.0);
+            if (!(sev > 0))
+                sev = 20.0;
+            if (!(saf >= 0))
+                saf = 90.0;
+            memset(&s_ms, 0, sizeof s_ms);
+            if (sms > 0 && sms <= 1000) {
+                s_ms.ms = sms;
+                s_ms.every = sev;
+                s_ms.next = CACurrentMediaTime() + saf;
+                fprintf(stderr, "[PRESENT] metal_stall: on, the present sleeps %.0f ms every %.1f s"
+                        " from %.1f s on (first at t=%.3f s)\n", s_ms.ms, s_ms.every, saf, s_ms.next);
+            } else if (sms != 0) {
+                fprintf(stderr, "[PRESENT] metal_stall=%s: not 1 to 1000 ms, off\n",
+                        recomp_env(RENV_METAL_STALL));
+            }
         }
         s_layer.allowsNextDrawableTimeout = YES;
         /* The values the layer really holds, after the configuration above. */
@@ -1322,14 +1353,54 @@ static void qdrain_sample(double wait_s, int k, uint32_t flip, double now)
     }
 }
 
+/* RECOMP_DEBUG=metal_stall=<ms> (test hook for metal_drain, KFC-1935): from
+ * metal_stall_after_s on, every metal_stall_every_s, one present call sleeps
+ * <ms> on the main thread before anything else, as a hitch of the title
+ * would. No present is made while it sleeps, so the layer's queue empties
+ * (it cannot go below none) while the guest goes on publishing. On waking
+ * this call presents the frame it was given, and the loop, woken by the
+ * frame published meanwhile, presents the newer one at once: two presents
+ * inside one refresh, which leaves the queue one deeper than before -- the
+ * surplus a real hitch leaves, seen as nextDrawable's wait. It sleeps before
+ * t_in, so neither the pacing line's drawable part nor metal_drain's window
+ * counts the sleep itself. Only for a frame past the black paint and not a
+ * shot, and never while metal_drain is armed or holding (a sleep over its
+ * hold would end the hold as "no new frame"): it waits for the next present
+ * then. The event pump sleeps with it. */
+static void stall_due(uint32_t fw, const char *shot_path)
+{
+    struct timespec ts;
+    double now, t1;
+
+    if (!fw || shot_path || s_qd.state)
+        return;
+    now = CACurrentMediaTime();
+    if (now < s_ms.next)
+        return;
+    ts.tv_sec = (time_t)(s_ms.ms / 1e3);
+    ts.tv_nsec = (long)((s_ms.ms - (double)ts.tv_sec * 1e3) * 1e6);
+    nanosleep(&ts, NULL);
+    t1 = CACurrentMediaTime();
+    s_ms.count++;
+    s_ms.next += s_ms.every;
+    if (s_ms.next <= t1)
+        s_ms.next = t1 + s_ms.every;
+    fprintf(stderr, "[PRESENT] metal_stall: slept %.1f ms (#%u, t=%.3f)\n",
+            (t1 - now) * 1e3, s_ms.count, now);
+}
+
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 uint32_t pad, int filter, const char *shot_path, uint32_t flip,
                 const struct nv2a_ovl_list *const *layers, int nlayers,
                 const struct fbm_pace_frame *pace)
 {
     int ok = 0;
+    double t_in, t_drw = 0;
+
+    if (s_ms.ms > 0)
+        stall_due(fw, shot_path);   /* metal_stall: before t_in, as a hitch of the title */
     /* the age split; metal_drain's wait */
-    double t_in = (pace || s_qd.n) ? CACurrentMediaTime() : 0, t_drw = 0;
+    t_in = (pace || s_qd.n) ? CACurrentMediaTime() : 0;
 
     if (s_qd.n && qdrain_hold(k, flip, fw, shot_path, t_in))
         return 0;   /* metal_drain: no drawable, no present; the frame stays dirty */

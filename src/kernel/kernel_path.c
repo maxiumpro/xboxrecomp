@@ -233,6 +233,57 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     return 0;
 }
 
+/*
+ * RECOMP_DEBUG=file_alias=<from>:<to> (test hook): a path whose last
+ * component is <from>, in any case, becomes <to> in the same folder, so a
+ * run reaches one level by opening another (scifi.level:forest.level). ':'
+ * splits the pair because RECOMP_DEBUG splits its entries at commas. Both
+ * backends call it after the drive links and before the rules, and go on
+ * with the rewritten path (no recursion, so a pair cannot loop).
+ *
+ * Returns 1 and fills `out`, 0 to leave the path alone: the key unset, a
+ * value that is not <from>:<to>, or another last component.
+ */
+#define FILE_ALIAS_LOG_MAX 16
+static atomic_int s_file_alias_logged;
+
+static int file_alias(const char *xbox_path, char *out, size_t out_size)
+{
+    const char *pair = recomp_env(RENV_FILE_ALIAS);
+    const char *colon, *to, *last, *p;
+    size_t from_len, to_len, dir_len, i;
+
+    if (!pair || !xbox_path || !out)
+        return 0;
+    colon = strchr(pair, ':');
+    if (!colon || colon == pair || !colon[1])
+        return 0;
+    from_len = (size_t)(colon - pair);
+    to = colon + 1;
+    to_len = strlen(to);
+
+    last = xbox_path;
+    for (p = xbox_path; *p; p++)
+        if (*p == '\\' || *p == '/')
+            last = p + 1;
+    if (strlen(last) != from_len)
+        return 0;
+    for (i = 0; i < from_len; i++)
+        if (tolower((unsigned char)last[i]) != tolower((unsigned char)pair[i]))
+            return 0;
+
+    dir_len = (size_t)(last - xbox_path);
+    if (dir_len + to_len + 1 > out_size)
+        return 0;
+    memcpy(out, xbox_path, dir_len);
+    memcpy(out + dir_len, to, to_len + 1);
+    if (atomic_fetch_add(&s_file_alias_logged, 1) < FILE_ALIAS_LOG_MAX) {
+        fprintf(stderr, "  [PATH] file_alias: %s -> %s\n", xbox_path, out);
+        fflush(stderr);
+    }
+    return 1;
+}
+
 /* ======================================================================== */
 /* Shared by both backends, for the same reason as xbox_LastFileError: the
  * bridge calls it unconditionally, and a _WIN32-only definition breaks every
@@ -1207,6 +1258,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const WCHAR* base_dir  = NULL;
     const char*  sub_dir   = NULL;
     int          skip;
+    char         aliased[512];
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
@@ -1219,6 +1271,10 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
             return xbox_translate_path(linked, host_path_buf, buf_size);
     }
+
+    /* RECOMP_DEBUG=file_alias: everything below sees the aliased name. */
+    if (file_alias(xbox_path, aliased, sizeof aliased))
+        xbox_path = aliased;
 
     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
         fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
@@ -1890,6 +1946,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const char* base_dir  = NULL;
     const char* sub_dir   = NULL;
     int         skip;
+    char        aliased[512];
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
@@ -1902,6 +1959,10 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
             return xbox_translate_path(linked, host_path_buf, buf_size);
     }
+
+    /* RECOMP_DEBUG=file_alias: everything below sees the aliased name. */
+    if (file_alias(xbox_path, aliased, sizeof aliased))
+        xbox_path = aliased;
 
     {
         int digit = xbox_partition_device_digit(xbox_path);

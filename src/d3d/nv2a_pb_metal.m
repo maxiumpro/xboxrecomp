@@ -702,6 +702,18 @@ static int null_now(void)
     return s_null_mode && nd_arm_b();
 }
 
+/* metal_clear_fold for the clear being encoded: =1 always, =alt on even
+ * flips; with metal_ab_alt only in arm B's blocks, so metal_gpu_blocks' arm
+ * line is fold against no fold. A held clear never crosses the
+ * flip (the commit's end_encoder encodes it), so a block edge is clean.
+ * s_cf_mode first: with the key off, nd_env is not touched. */
+static int cf_now(void)
+{
+    if (!s_cf_mode || (s_cf_mode == 2 && (s_presents & 1)))
+        return 0;
+    return nd_arm_b();
+}
+
 /* The passes bookkeeping, for either trace and for metal_depth_dontcare,
  * which guesses from it (pt_dc_guess). */
 static int pt_on(void)
@@ -1688,10 +1700,11 @@ static void pt_judge(PtFrame *f)
                     " (%llu more merged into a held one), %llu folded into the next pass on their"
                     " textures; encoded as before: %llu for a pass on part of their textures, at an"
                     " end of pass for:%s; not held: %llu with an occlusion query open, %llu with %d"
-                    " held already\n", s_pts.flips, (unsigned long long)s_pts.cf_held,
+                    " held already%s\n", s_pts.flips, (unsigned long long)s_pts.cf_held,
                     (unsigned long long)s_pts.cf_merged, (unsigned long long)s_pts.cf_folded,
                     (unsigned long long)s_pts.cf_shared, at ? line : " none",
-                    (unsigned long long)s_pts.cf_query, (unsigned long long)s_pts.cf_full, FOLD_HELD_MAX);
+                    (unsigned long long)s_pts.cf_query, (unsigned long long)s_pts.cf_full, FOLD_HELD_MAX,
+                    arm);
         }
         memset(&s_pts, 0, sizeof s_pts);
     }
@@ -2323,6 +2336,13 @@ static int init(void)
                     " on the same colour and depth textures, and is encoded as before ahead of"
                     " anything else that ends a pass, reads its target or shares only part of"
                     " them\n");
+        if (s_cf_mode) {   /* with metal_ab_alt: arm B's blocks only (cf_now) */
+            nd_env();
+            if (s_ab_blk)
+                fprintf(stderr, LOGP "metal_clear_fold with metal_ab_alt: held only in arm B's"
+                        " blocks (flips %d-%d, %d-%d, ...); arm A encodes every clear as before\n",
+                        s_ab_blk, 2 * s_ab_blk - 1, 3 * s_ab_blk, 4 * s_ab_blk - 1);
+        }
         /* Every Mac GPU samples BC; an iPad before the A-series GPUs that
          * report it does not, and its pack BC3 entries go up from the guest. */
 #if TARGET_OS_OSX
@@ -2997,7 +3017,7 @@ static void metal_on_clear(uint32_t param)
         s_clears++;
         if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
             PT_WHY(PT_CLEAR);
-            s_cf_call = s_cf_mode == 1 || (s_cf_mode == 2 && !(s_presents & 1));   /* metal_clear_fold: it may be held */
+            s_cf_call = cf_now();   /* metal_clear_fold: it may be held */
             begin_encoder(rt, 1, c);
             s_cf_call = 0;
             return;
@@ -3084,7 +3104,7 @@ static void metal_on_zclear(uint32_t param)
         if (dt->earlyz)
             z = nv2a_w_earlyz_clear(z, nv2a_zmax(g->format), nv2a_w_earlyz_b());
         PT_WHY(PT_ZCLEAR);
-        s_cf_call = s_cf_mode == 1 || (s_cf_mode == 2 && !(s_presents & 1));   /* metal_clear_fold: it may be held */
+        s_cf_call = cf_now();   /* metal_clear_fold: it may be held */
         begin_pass(rt, 0, NULL, param & 3u, z, v->zclear & 0xFFu);
         s_cf_call = 0;
         if (param & 1u)
