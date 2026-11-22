@@ -469,12 +469,14 @@ static void prof_add(uint64_t *acc, uint64_t t0)
 enum {
     PT_UNTAGGED, PT_TARGET, PT_RESUME, PT_DEPTH, PT_ZCLEAR, PT_CLEAR, PT_CLEAR_Q, PT_ZTEX,
     PT_SELF_COPY, PT_BLIT, PT_GROW, PT_SYNC, PT_REPORT, PT_QUERY_READ, PT_RING, PT_EVICT,
-    PT_FLIP, PT_DEBUG, PT_HOST_PIXELS, PT_SCALE, PT_NWHY
+    PT_FLIP, PT_DEBUG, PT_HOST_PIXELS, PT_SCALE, PT_FOLD_READ, PT_NWHY
 };
+/* fold-read: metal_clear_fold's held clear is encoded before a draw samples
+ * its target (rt_texture). */
 static const char *const s_pt_why_name[PT_NWHY] = {
     "untagged", "target", "resume", "depth-attach", "zclear", "clear", "clear-in-query", "ztex",
     "self-copy", "blit", "grow", "readback", "report", "query-read", "ring-full", "evict",
-    "flip", "debug-draw", "host-pixels", "scale"
+    "flip", "debug-draw", "host-pixels", "scale", "fold-read"
 };
 static int s_pt_why;   /* the reason the next end_encoder or begin_pass runs for */
 #define PT_WHY(r) (s_pt_why = (r))
@@ -508,6 +510,7 @@ typedef struct {
     uint8_t  reopen;            /* the same colour target loaded right after its pass closed:
                                  * that close's reason; 0xFF */
     uint8_t  dc;                /* metal_depth_dontcare opened it DontCare */
+    uint8_t  fold;              /* metal_clear_fold: a held clear became its load actions */
     /* The shader of its first draw (pt_shader), for metal_passes_at: the
      * fragment function's FNV-1a (its pointer, the pipeline key's fs), the
      * stages sampling a texture, their host sizes, nv2a_snap_uv in play */
@@ -564,6 +567,11 @@ static struct {
     uint64_t span_ticks, idle_ticks; /* the frames' first sample to last, and the gaps in it */
     uint64_t cmd_ns;            /* the command buffers' GPU time (prof_flip_end) */
     uint64_t dc_passes, dc_miss;     /* metal_depth_dontcare */
+    /* metal_clear_fold: clears held, merged into a held one, not held (an
+     * occlusion query open, the table full); held ones folded into the next
+     * pass on their textures, or encoded as before: for a pass sharing part
+     * of them, or at an end_encoder by its reason */
+    uint64_t cf_held, cf_merged, cf_query, cf_full, cf_folded, cf_shared, cf_end[PT_NWHY];
     uint64_t fh_draws;               /* metal_flat_half: draws scissored */
     uint64_t cpu_n;                  /* metal_gpu_blocks: frames with a scene pass, */
     double   cpu_sum_ms, cpu_max_ms; /* its close to the flip's commit */
@@ -579,6 +587,28 @@ static uint64_t s_scene_close_ns;   /* metal_gpu_blocks: the last scene or mixed
 static MTLScissorRect s_draw_sr;    /* the open draw's scissor (metal_flat_half re-sets it) */
 static int  s_dc_pass;          /* the open pass's depth and stencil are DontCare */
 static int  s_dc_opener;        /* begin_pass is opened for a draw using neither */
+/* RECOMP_DEBUG=metal_clear_fold=1 (probe, KFC-1105): a whole-target colour
+ * clear (metal_on_clear) or a depth clear (metal_on_zclear) opens no pass.
+ * Its descriptor is held, and the next pass on the same colour and depth
+ * textures loads them with its Clears instead of Load. Anything that ends a
+ * pass outside begin_pass (end_encoder: a blit, a compute, a commit, a
+ * readback, an eviction), a pass on only part of its textures, a draw
+ * sampling its target (rt_texture) or a free of its target or depth
+ * buffer encodes it first, as it would have been encoded. Held ones never
+ * share a texture. s_cf_mode is set by init. */
+#define CF_MAX 4
+typedef struct {
+    MTLRenderPassDescriptor *rp;   /* retained; nil: a free entry */
+    RenderTarget *rt;
+    DepthTarget  *dt;
+    const void   *ctex, *ztex;     /* its textures, identity only */
+    int           why, had;        /* begin_pass's, for pt_open when encoded */
+} CfHeld;
+static CfHeld s_cf[CF_MAX];
+static int  s_cf_n;             /* entries held */
+static int  s_cf_mode;          /* metal_clear_fold */
+static int  s_cf_call;          /* begin_pass is opened by a whole-target clear */
+static int  s_cf_hold;          /* this end_encoder leaves the held clears held */
 static long s_pt_at = -1;       /* metal_passes_at */
 static int  s_gb_on = -1;       /* metal_gpu_blocks: sampling */
 static id   s_gb_sb[2];         /* id<MTLCounterSampleBuffer> by flip parity */
@@ -1427,13 +1457,13 @@ static void pt_detail(const PtFrame *f, double nspt)
                 snprintf(sh + sn, sizeof sh - sn, " snap %u", p->snap);
         }
         fprintf(stderr, LOGP "pass %llu #%d %s open=%s%s%s close=%s draws %u (%s) clears %u"
-                " (%u depth or stencil) kind %s%s%s%s%s%s%s%s\n", (unsigned long long)f->flip, i,
+                " (%u depth or stencil) kind %s%s%s%s%s%s%s%s%s\n", (unsigned long long)f->flip, i,
                 s_ptk_name[p->kind], s_pt_why_name[p->open_why], p->after != 0xFF ? " after " : "",
                 p->after != 0xFF ? s_pt_why_name[p->after] : "", s_pt_why_name[p->close_why],
                 p->draws, pt_cat_draws(p, cd, sizeof cd), p->clears, p->zdraws,
                 nv2a_gpu_cat_name(p->cat), p->mixed ? " (mixed)" : "",
                 p->dc == 1 ? " depth-dontcare" : p->dc == 2 ? " depth-dontcare (wrong guess)" : "",
-                gpu,
+                p->fold ? " clear-folded" : "", gpu,
                 p->kind == PTK_RENDER ? at[0] : "", p->kind == PTK_RENDER ? at[1] : "",
                 p->kind == PTK_RENDER ? at[2] : "", sh);
     }
@@ -1647,6 +1677,22 @@ static void pt_judge(PtFrame *f)
                     " DontCare, %llu wrong guesses%s\n", s_pts.flips,
                     (unsigned long long)s_pts.dc_passes, (unsigned long long)s_pts.dc_miss,
                     s_dc_mode == 2 ? " (alt: even flips only)" : "");
+        if (s_cf_mode) {
+            at = 0;
+            line[0] = 0;
+            for (k = 0; k < PT_NWHY && at < sizeof line; k++)
+                if (s_pts.cf_end[k])
+                    at += (size_t)snprintf(line + at, sizeof line - at, " %s %llu",
+                                           s_pt_why_name[k], (unsigned long long)s_pts.cf_end[k]);
+            fprintf(stderr, LOGP "metal_clear_fold over %d flips: %llu whole-target clears held"
+                    " (%llu more merged into a held one), %llu folded into the next pass on their"
+                    " textures; encoded as before: %llu for a pass on part of their textures, at an"
+                    " end of pass for:%s; not held: %llu with an occlusion query open, %llu with %d"
+                    " held already\n", s_pts.flips, (unsigned long long)s_pts.cf_held,
+                    (unsigned long long)s_pts.cf_merged, (unsigned long long)s_pts.cf_folded,
+                    (unsigned long long)s_pts.cf_shared, at ? line : " none",
+                    (unsigned long long)s_pts.cf_query, (unsigned long long)s_pts.cf_full, CF_MAX);
+        }
         memset(&s_pts, 0, sizeof s_pts);
     }
 }
@@ -1697,8 +1743,11 @@ static uint64_t s_enc_serial;
 static struct { uint64_t enc; uint32_t gen; int ok; } s_vc1;
 static uint64_t s_c_uploads;   /* c[] writes to buffer 1; "consts" in the flip trace */
 
+static void cf_encode(int i, int close_why);   /* metal_clear_fold, after ensure_cmd */
+
 static void end_encoder(void)
 {
+    int why = s_pt_why;   /* metal_clear_fold: the held clears close for it */
     if (s_enc) {
         if (pt_on())
             pt_close();   /* metal_passes: why it closes (s_pt_why) */
@@ -1711,6 +1760,17 @@ static void end_encoder(void)
     s_dc_pass = 0;
     s_enc_rt = NULL;
     s_enc_dt = NULL;
+    /* RECOMP_DEBUG=metal_clear_fold: whatever ends a pass here (not
+     * begin_pass's own end) runs after the held clears: they are encoded
+     * now, each closed for this reason. Never set with the switch off. */
+    if (s_cf_n && !s_cf_hold) {
+        int i;
+        for (i = 0; i < CF_MAX; i++)
+            if (s_cf[i].rp) {
+                s_pts.cf_end[why]++;
+                cf_encode(i, why);
+            }
+    }
 }
 
 /* ---- Submissions (KFC-1720 H1b, step 2) -------------------------------------
@@ -1972,6 +2032,92 @@ static void ensure_cmd(void)
         s_cmd = [[s_queue commandBuffer] retain];
 }
 
+/* metal_clear_fold: from's Clears onto to, where to loads (over: wherever). */
+static void cf_apply(MTLRenderPassDescriptor *to, MTLRenderPassDescriptor *from, int over)
+{
+    MTLRenderPassColorAttachmentDescriptor *tc = to.colorAttachments[0];
+    MTLRenderPassColorAttachmentDescriptor *fc = from.colorAttachments[0];
+    if (fc.loadAction == MTLLoadActionClear && (over || tc.loadAction == MTLLoadActionLoad)) {
+        tc.loadAction = MTLLoadActionClear;
+        tc.clearColor = fc.clearColor;
+    }
+    if (from.depthAttachment.texture && from.depthAttachment.loadAction == MTLLoadActionClear
+            && (over || to.depthAttachment.loadAction == MTLLoadActionLoad)) {
+        to.depthAttachment.loadAction = MTLLoadActionClear;
+        to.depthAttachment.clearDepth = from.depthAttachment.clearDepth;
+    }
+    if (from.stencilAttachment.texture && from.stencilAttachment.loadAction == MTLLoadActionClear
+            && (over || to.stencilAttachment.loadAction == MTLLoadActionLoad)) {
+        to.stencilAttachment.loadAction = MTLLoadActionClear;
+        to.stencilAttachment.clearStencil = from.stencilAttachment.clearStencil;
+    }
+}
+
+/* The held clear h is on exactly rt's colour and dt's depth (or none). */
+static int cf_same(const CfHeld *h, const RenderTarget *rt, const DepthTarget *dt)
+{
+    return h->rt == rt && h->ctex == (const void *)rt->tex && h->dt == dt
+        && (!dt || h->ztex == (const void *)dt->tex);
+}
+
+/* ... or on one of them. */
+static int cf_shares(const CfHeld *h, const RenderTarget *rt, const DepthTarget *dt)
+{
+    return h->ctex == (const void *)rt->tex || (dt && h->ztex == (const void *)dt->tex);
+}
+
+/* The held clear i encoded as begin_pass would have encoded it (pt_open,
+ * the occlusion query's slot) and closed for close_why. No pass is open. */
+static void cf_encode(int i, int close_why)
+{
+    CfHeld *h = &s_cf[i];
+    MTLRenderPassDescriptor *rp = h->rp;
+    int hold = s_cf_hold;
+    if (!rp)
+        return;
+    h->rp = nil;
+    s_cf_n--;
+    @autoreleasepool {
+        ensure_cmd();
+        if (pt_on())
+            pt_open(h->rt, h->dt, rp, h->why, h->had);
+        s_enc = [[s_cmd renderCommandEncoderWithDescriptor:rp] retain];
+        s_enc_serial++;
+        s_enc_rt = h->rt;
+        s_enc_dt = h->dt;
+        occ_pass_begin();
+        s_cf_hold = 1;   /* the other held ones stay: the caller has them */
+        PT_WHY(close_why);
+        end_encoder();
+        s_cf_hold = hold;
+    }
+    [rp release];
+}
+
+/* The held clear i encoded now, the open pass (another target's) ending
+ * first for `why`. */
+static void cf_spill(int i, int why)
+{
+    int hold = s_cf_hold;
+    if (s_enc) {
+        s_cf_hold = 1;
+        PT_WHY(why);
+        end_encoder();
+        s_cf_hold = hold;
+    }
+    s_pts.cf_end[why]++;
+    cf_encode(i, why);
+}
+
+/* Before rt (its colour) or dt goes, or is read: its held clears encoded. */
+static void cf_drop(const RenderTarget *rt, const DepthTarget *dt, int why)
+{
+    int i;
+    for (i = 0; i < CF_MAX && s_cf_n; i++)
+        if (s_cf[i].rp && ((rt && s_cf[i].rt == rt) || (dt && s_cf[i].dt == dt)))
+            cf_spill(i, why);
+}
+
 /* Before a CPU write into memory the GPU uses (KFC-1720 H1b step 3b): when
  * the open s_cmd uses it (*pend), s_cmd is committed first (`pt` tags its
  * pass end, metal_passes), which numbers *sub; then every submission up to
@@ -2006,7 +2152,10 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     MTLRenderPassDescriptor *rp;
     DepthTarget *dt = rt->dt;
     int why = s_pt_why, had = s_enc != nil;   /* metal_passes: end_encoder consumes it */
+    int fold = 0;   /* metal_clear_fold: a held clear became this pass's load actions */
+    s_cf_hold = 1;   /* metal_clear_fold: the held clears are decided below */
     end_encoder();
+    s_cf_hold = 0;
     ensure_cmd();
     rt->dirty = 1;
     rt->wpend = 1;   /* the pass writes it: s_cmd's number is its last write */
@@ -2036,20 +2185,82 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
         rp.stencilAttachment.loadAction = sc ? MTLLoadActionClear : MTLLoadActionLoad;
         rp.stencilAttachment.clearStencil = (zmask & 2u) ? (st & 0xFFu) : 0u;
         dt->fresh = 0;
-        /* RECOMP_DEBUG=metal_depth_dontcare (pt_dc_guess): neither loaded
-         * into tile memory nor stored back. s_dc_opener is only ever set
-         * with the switch on. */
-        if (s_dc_opener && !zc && !sc && pt_dc_guess(rt, dt)) {
-            rp.depthAttachment.loadAction = MTLLoadActionDontCare;
-            rp.depthAttachment.storeAction = MTLStoreActionDontCare;
-            rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
-            rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
-            s_dc_pass = 1;
-        }
     }
     rp.visibilityResultBuffer = s_vis;
-    if (pt_on())
+    /* RECOMP_DEBUG=metal_clear_fold (s_cf): a held clear on exactly these
+     * textures takes this clear's Clears (a clear: nothing is opened) or
+     * gives this pass its own where it loads; one on part of them is
+     * encoded first. A whole-target clear is then held, unless an
+     * occlusion query is open or the table is full. Off: s_cf_n is 0. */
+    if (s_cf_mode) {
+        int i, merged = 0;
+        for (i = 0; i < CF_MAX && s_cf_n; i++) {
+            CfHeld *h = &s_cf[i];
+            if (!h->rp)
+                continue;
+            if (cf_same(h, rt, dt)) {
+                if (s_cf_call) {
+                    cf_apply(h->rp, rp, 1);   /* the later clear's actions win */
+                    merged = 1;
+                } else {
+                    cf_apply(rp, h->rp, 0);
+                    [h->rp release];
+                    h->rp = nil;
+                    s_cf_n--;
+                    fold = 1;
+                    s_pts.cf_folded++;
+                }
+            } else if (cf_shares(h, rt, dt)) {
+                s_pts.cf_shared++;
+                cf_encode(i, why);
+            }
+        }
+        if (merged) {
+            s_pts.cf_merged++;
+            return;
+        }
+        if (s_cf_call) {
+            for (i = 0; i < CF_MAX && s_cf[i].rp; i++)
+                ;
+            if (s_occ_q) {
+                s_pts.cf_query++;
+            } else if (i == CF_MAX) {
+                s_pts.cf_full++;
+            } else {
+                CfHeld *h = &s_cf[i];
+                h->rp = [rp retain];
+                h->rt = rt;
+                h->dt = dt;
+                h->ctex = (const void *)rt->tex;
+                h->ztex = dt ? (const void *)dt->tex : NULL;
+                h->why = why;
+                h->had = had;
+                s_cf_n++;
+                s_pts.cf_held++;
+                return;
+            }
+        }
+    }
+    /* RECOMP_DEBUG=metal_depth_dontcare (pt_dc_guess): neither loaded into
+     * tile memory nor stored back, when this pass loads both (a held
+     * clear's Clears count). s_dc_opener is only ever set with the switch
+     * on. */
+    if (dt && s_dc_opener && rp.depthAttachment.loadAction == MTLLoadActionLoad
+            && rp.stencilAttachment.loadAction == MTLLoadActionLoad && pt_dc_guess(rt, dt)) {
+        rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+        rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+        rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
+        rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+        s_dc_pass = 1;
+    }
+    if (pt_on()) {
         pt_open(rt, dt, rp, why, had);   /* metal_passes, and the timestamps of metal_gpu_blocks */
+        if (fold) {
+            PtPass *p = pt_cur_pass();
+            if (p)
+                p->fold = 1;
+        }
+    }
     s_enc = [[s_cmd renderCommandEncoderWithDescriptor:rp] retain];
     s_enc_serial++;
     s_enc_rt = rt;
@@ -2100,6 +2311,13 @@ static int init(void)
         if (s_inflight > 1)
             fprintf(stderr, LOGP "metal_inflight=2: the flip commits the frame without waiting;"
                     " at the end of flip N the CPU waits for flip N-1's work\n");
+        s_cf_mode = recomp_env_on(RENV_METAL_CLEAR_FOLD);
+        if (s_cf_mode)
+            fprintf(stderr, LOGP "KFC-1105: metal_clear_fold=1: a whole-target colour clear or a"
+                    " depth clear opens no pass; it becomes the Clear load actions of the next pass"
+                    " on the same colour and depth textures, and is encoded as before ahead of"
+                    " anything else that ends a pass, reads its target or shares only part of"
+                    " them\n");
         /* Every Mac GPU samples BC; an iPad before the A-series GPUs that
          * report it does not, and its pack BC3 entries go up from the guest. */
 #if TARGET_OS_OSX
@@ -2254,6 +2472,7 @@ static void rt_free(RenderTarget *rt)
         return;
     if (rt->dirty && rt->presented)
         rt_sync(rt, rt->pitch);
+    cf_drop(rt, NULL, PT_EVICT);   /* metal_clear_fold: its held clear, as before */
     if (s_enc_rt == rt) {
         PT_WHY(PT_EVICT);
         end_encoder();
@@ -2312,6 +2531,7 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     }
     if (!e) {
         e = lru;
+        cf_drop(NULL, e, PT_EVICT);   /* metal_clear_fold: its held clear, as before */
         if (s_enc_dt == e) {
             PT_WHY(PT_EVICT);
             end_encoder();
@@ -2764,7 +2984,9 @@ static void metal_on_clear(uint32_t param)
         s_clears++;
         if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
             PT_WHY(PT_CLEAR);
+            s_cf_call = s_cf_mode;   /* metal_clear_fold: it may be held */
             begin_encoder(rt, 1, c);
+            s_cf_call = 0;
             return;
         }
         if (!s_enc || s_enc_rt != rt) {
@@ -2849,7 +3071,9 @@ static void metal_on_zclear(uint32_t param)
         if (dt->earlyz)
             z = nv2a_w_earlyz_clear(z, nv2a_zmax(g->format), nv2a_w_earlyz_b());
         PT_WHY(PT_ZCLEAR);
+        s_cf_call = s_cf_mode;   /* metal_clear_fold: it may be held */
         begin_pass(rt, 0, NULL, param & 3u, z, v->zclear & 0xFFu);
+        s_cf_call = 0;
         if (param & 1u)
             s_zclears++;
     }
@@ -5133,6 +5357,7 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
             self = rt;
             continue;
         }
+        cf_drop(rt, NULL, PT_FOLD_READ);   /* metal_clear_fold: its held clear, before the draw */
         return rt;
     }
     if (!self)
@@ -8054,6 +8279,7 @@ static void scale_drop(void)
             DepthTarget *d = &s_dt[i];
             if (!d->tex)
                 continue;
+            cf_drop(NULL, d, PT_SCALE);   /* metal_clear_fold: its held clear, as before */
             if (s_enc_dt == d) {
                 PT_WHY(PT_SCALE);
                 end_encoder();
