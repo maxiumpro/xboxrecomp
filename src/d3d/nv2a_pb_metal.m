@@ -3448,6 +3448,150 @@ static int memo_on(void)
     return on;
 }
 
+/* RECOMP_DEBUG=metal_direct_cache (KFC-1015), a probe read once: D3D11's two
+ * lookup shortcuts on this (the ack, translating) thread, to measure the CPU
+ * they save. tex_bind_body checks a texture-key hint (s_tc_hint, D3D11's
+ * tc_slot) before its scan of s_tc; fs_select_body, after its one-entry memo
+ * misses, a direct table of key[38] (s_fsd) before d3d8_combiners_from_regs
+ * and its scan of s_fs. A hit is what the scan finds: a live texture key is
+ * in one entry only (one is made only when the scan finds none), and s_fs is
+ * append-only, its entry a function of key[38] alone. s_dk_mode: 0 off
+ * (unset or 0: the code as before), 1 both on, 2 alt (on in odd blocks of
+ * s_dk_blk flips, off in even ones, a line per block), 3 check (both lookups
+ * each call, the scan's answer used, differences counted). */
+#define TC_HINTS  2048
+#define FSD_SLOTS 1024
+#define DK_BLOCK  600
+typedef struct { uint32_t gen; int idx; uint32_t key[38]; } FsdSlot;
+static int      s_dk_mode = -1;
+static uint32_t s_dk_blk = DK_BLOCK;
+static uint16_t s_tc_hint[TC_HINTS];   /* texture key hash -> s_tc index + 1 */
+static FsdSlot  s_fsd[FSD_SLOTS];      /* key[38] -> s_fs index, valid at s_fsd_gen */
+static uint32_t s_fsd_gen = 1;         /* bump to drop every slot; nothing drops s_fs entries */
+static struct { uint64_t tex_binds, tex_hits, tex_dif, fs_lookups, fs_hits, fs_dif; } s_dk_n;
+static uint64_t  s_dk_cpu0;            /* the block's start, this thread's CPU ns */
+static pthread_t s_dk_th;              /* the thread dk_env first ran on */
+
+static uint64_t dk_cpu_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts))
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void dk_env(void)
+{
+    const char *e = recomp_env(RENV_METAL_DIRECT_CACHE);
+    s_dk_mode = 0;
+    if (!e || !*e || *e == '0')
+        return;
+    if (!strncasecmp(e, "alt", 3) && (!e[3] || e[3] == ':')) {
+        long b = e[3] ? strtol(e + 4, NULL, 10) : 0;
+        s_dk_mode = 2;
+        if (b > 0)
+            s_dk_blk = b > 1000000 ? 1000000u : (uint32_t)b;
+    } else if (!strcasecmp(e, "check")) {
+        s_dk_mode = 3;
+    } else if (e[0] == '1' && !e[1]) {
+        s_dk_mode = 1;
+    } else {
+        fprintf(stderr, "[METAL] direct_cache: metal_direct_cache=%s is not 1, alt, alt:N or"
+                " check: off\n", e);
+        return;
+    }
+    s_dk_th = pthread_self();
+    s_dk_cpu0 = dk_cpu_ns();
+    if (s_dk_mode == 2)
+        fprintf(stderr, "[METAL] direct_cache: mode alt, blocks of %u flips: arm A (off) on even"
+                " blocks, arm B (texture hint and fs table on) on odd ones\n", s_dk_blk);
+    else
+        fprintf(stderr, "[METAL] direct_cache: mode %s\n", s_dk_mode == 1
+                ? "1 (texture hint and fs table on)"
+                : "check (both lookups each call, the scan's answer used, differences counted)");
+}
+
+/* This call's metal_direct_cache: 0 off (or alt's arm A), 1 the shortcut,
+ * 2 check. */
+static int dk_now(void)
+{
+    if (s_dk_mode < 0)
+        dk_env();
+    switch (s_dk_mode) {
+    case 1: return 1;
+    case 2: return (int)((s_presents / s_dk_blk) & 1u);
+    case 3: return 2;
+    }
+    return 0;
+}
+
+/* D3D11's tc_slot: the texture key's hint slot. */
+static uint32_t tc_slot(const Stage *t, int cube)
+{
+    uint32_t h = (t->offset + (uint32_t)cube) * 0x9E3779B1u;
+    h ^= (t->color + (t->width << 8) + (t->height << 20)) * 0x85EBCA77u;
+    h ^= (t->pitch ^ t->palette ^ (t->levels << 27)) * 0xC2B2AE3Du;
+    return (h >> 16) & (TC_HINTS - 1);
+}
+
+/* The hinted entry when it is live with t's key (the scan's match), else
+ * NULL: a stale or colliding hint falls through to the scan. */
+static TexEntry *tc_hinted(uint32_t slot, const Stage *t, int cube)
+{
+    TexEntry *c;
+    if (!s_tc_hint[slot])
+        return NULL;
+    c = &s_tc[s_tc_hint[slot] - 1];
+    if (c->live && c->offset == t->offset && c->color == t->color
+            && c->width == t->width && c->height == t->height
+            && c->pitch == t->pitch && c->palette == t->palette
+            && c->levels == t->levels && c->cube == cube)
+        return c;
+    return NULL;
+}
+
+/* fs_select_body's key[38] -> its s_fsd slot (word-wise, cheap). */
+static FsdSlot *fsd_slot(const uint32_t *key)
+{
+    uint32_t h = 0x811c9dc5u;
+    int i;
+    for (i = 0; i < 38; i++)
+        h = (h ^ key[i]) * 0x01000193u;
+    return &s_fsd[(h ^ (h >> 16)) & (FSD_SLOTS - 1)];
+}
+
+/* At each flip, after s_presents++ (metal_flip): alt's block line, with
+ * this thread's CPU time over the block, or check's counts every
+ * DK_BLOCK flips. */
+static void dk_flip(void)
+{
+    static int said_th;
+    if (s_dk_mode < 0)
+        dk_env();
+    if (s_dk_mode < 2)
+        return;
+    if (!said_th && !pthread_equal(s_dk_th, pthread_self())) {
+        said_th = 1;
+        fprintf(stderr, "[METAL] direct_cache: the flip runs on another thread than the first"
+                " lookup; translate cpu is the flip thread's\n");
+    }
+    if (s_dk_mode == 2 && s_presents % s_dk_blk == 0) {
+        uint64_t k = s_presents / s_dk_blk - 1, now = dk_cpu_ns();
+        fprintf(stderr, "[METAL] direct_cache block %llu arm %c: flips %u, translate cpu %.3f"
+                " ms/flip, tex hint hits %llu/%llu, fs table hits %llu/%llu\n",
+                (unsigned long long)k, (k & 1u) ? 'B' : 'A', s_dk_blk,
+                (double)(now - s_dk_cpu0) / 1e6 / s_dk_blk,
+                (unsigned long long)s_dk_n.tex_hits, (unsigned long long)s_dk_n.tex_binds,
+                (unsigned long long)s_dk_n.fs_hits, (unsigned long long)s_dk_n.fs_lookups);
+        s_dk_cpu0 = now;
+        memset(&s_dk_n, 0, sizeof s_dk_n);
+    } else if (s_dk_mode == 3 && s_presents % DK_BLOCK == 0) {
+        fprintf(stderr, "[METAL] direct_cache check: tex %llu/%llu, fs %llu/%llu\n",
+                (unsigned long long)s_dk_n.tex_dif, (unsigned long long)s_dk_n.tex_hits,
+                (unsigned long long)s_dk_n.fs_dif, (unsigned long long)s_dk_n.fs_hits);
+    }
+}
+
 static void build_stages(void)
 {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
@@ -3751,7 +3895,22 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         return s_magenta;
     }
     uint32_t n = tex_cache_n();
-    for (i = 0; i < n; i++) {
+    /* RECOMP_DEBUG=metal_direct_cache: the hint before the scan (=1, which
+     * a hit skips: it only matches and picks the victim), or beside it
+     * (check, the scan's answer used) */
+    int dk = dk_now();
+    uint32_t slot = 0;
+    TexEntry *hint = NULL;
+    if (dk) {
+        slot = tc_slot(t, cube);
+        hint = tc_hinted(slot, t, cube);
+        s_dk_n.tex_hits += hint != NULL;
+        if (dk == 1)
+            e = hint;
+    }
+    if (s_dk_mode)
+        s_dk_n.tex_binds++;
+    for (i = 0; !e && i < n; i++) {
         TexEntry *c = &s_tc[i];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
@@ -3763,6 +3922,8 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         if (!c->live || (victim->live && c->used < victim->used))
             victim = c;
     }
+    if (dk == 2 && hint)
+        s_dk_n.tex_dif += hint != e;
     if (e) {
         /* A pack toggle (nv2a_tex_pack_gen) changes what the same texels
          * upload as: re-upload as if the hash had moved. */
@@ -3814,6 +3975,8 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         e->live = 1;
     }
     e->used = ++s_tc_clock;
+    if (dk)
+        s_tc_hint[slot] = (uint16_t)(e - s_tc + 1);
     s_tex_last = e;
     return e->tex;
 }
@@ -4463,9 +4626,10 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     static struct { int valid, nd, fast; uint32_t r[38]; id<MTLFunction> fn; } memo;
     NV2ACombinerState st;
     uint32_t key[38], modes = 0, inputs = 0, hash;
-    FsEntry *e = NULL;
+    FsEntry *e = NULL, *hit = NULL;
+    FsdSlot *f = NULL;
     char what[32];
-    int n, fast;
+    int n, fast, dk, nd_bit;
 
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
         return fs_basic_pick();
@@ -4505,6 +4669,23 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
         s_fs_sel_nd = memo.nd;
         s_fs_sel_fast = memo.fast;
         return memo.fn;
+    }
+    /* RECOMP_DEBUG=metal_direct_cache: the table of key[38] before st and
+     * the scan (=1; a hit is their entry, and goes on as they would), or
+     * beside them (check, their answer used) */
+    dk = dk_now();
+    if (s_dk_mode)
+        s_dk_n.fs_lookups++;
+    if (dk) {
+        f = fsd_slot(key);
+        if (f->gen == s_fsd_gen && f->idx < s_fs_n && !memcmp(f->key, key, sizeof key))
+            hit = &s_fs[f->idx];
+        s_dk_n.fs_hits += hit != NULL;
+        if (dk == 1 && hit) {
+            e = hit;
+            nd_bit = (int)(key[36] >> 11 & 1u);   /* st.no_discard */
+            goto fs_found;
+        }
     }
 
     memset(&st, 0, sizeof st);
@@ -4558,13 +4739,22 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
             s_fs_compiled++;
         }
     }
+    nd_bit = st.no_discard;
+    if (dk == 2 && hit)
+        s_dk_n.fs_dif += hit != e || hit->fn != e->fn || hit->bad != e->bad;
+fs_found:
+    if (dk && hit != e) {   /* metal_direct_cache: the slot now names e */
+        f->gen = s_fsd_gen;
+        f->idx = (int)(e - s_fs);
+        memcpy(f->key, key, sizeof key);
+    }
     memcpy(memo.r, key, sizeof key);
     memo.valid = 1;
     if (e->bad) {
         memo.fn = fs_basic_pick();   /* as D3D11: the basic PS */
     } else {
         memo.fn = e->fn;
-        s_fs_sel_nd = st.no_discard;
+        s_fs_sel_nd = nd_bit;
         s_fs_sel_fast = e->fast & 1;
     }
     memo.nd = s_fs_sel_nd;
@@ -8089,6 +8279,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         }
     }
     s_presents++;
+    dk_flip();   /* RECOMP_DEBUG=metal_direct_cache; off: returns */
     nv2a_w_earlyz_flip();
     /* The [MEM] exit line's GPU figure: every allocation this device made
      * for the process (the presenter's too, on the shared device). Unified
