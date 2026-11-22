@@ -267,6 +267,43 @@ static int s_nd_elig;        /* this draw: none of its kills could fire */
 static int s_nd_taken;       /* this draw's pixel shader is the variant: 1 combiners, 2 basic */
 static struct { uint64_t draws, elig, comb, basic, w; } s_ndc;
 
+/* RECOMP_DEBUG=d3d11_ab_alt=N (KFC-2100c): metal_ab_alt's twin, the block N
+ * flips instead of 300. Arm A (d3d11_nodiscard off: s_nd 0 for every draw)
+ * on even blocks, flips 0..N-1, 2N..3N-1, ...; arm B (d3d11_nodiscard as
+ * set) on odd ones. The draw's choice is already in the combiners' memo key
+ * (key[36] bit 11) and the basic variant has its own objects, so the switch
+ * touches no cache. Without d3d11_nodiscard both arms are the same (the
+ * null control). ab_flip logs each block's frame times. 0 off: nothing
+ * else is read. */
+#define AB_MAX 8192   /* s_ab_iv: the frame times a block holds */
+static long s_ab_n = -1;   /* flips per block; 0 off */
+
+static long ab_blk(void)
+{
+    if (s_ab_n < 0) {
+        const char *e = recomp_env(RENV_D3D11_AB_ALT);
+        long n = recomp_env_int(RENV_D3D11_AB_ALT, 0);
+        s_ab_n = n > 0 ? n : 0;
+        if (e && n <= 0 && e[0] != '0')
+            fprintf(stderr, LOGP "d3d11_ab_alt=%s: not an integer > 0, off\n", e);
+        if (s_ab_n > AB_MAX) {
+            fprintf(stderr, LOGP "d3d11_ab_alt=%ld: blocks of %d flips, the frame times' cap\n",
+                    s_ab_n, AB_MAX);
+            s_ab_n = AB_MAX;
+        }
+        if (s_ab_n)
+            fprintf(stderr, LOGP "KFC-2100c: d3d11_ab_alt=%ld: arm A (d3d11_nodiscard off) on even"
+                    " blocks of %ld flips, arm B (as set) on odd ones\n", s_ab_n, s_ab_n);
+    }
+    return s_ab_n;
+}
+
+/* This flip (s_presents, the draws' flip) is in arm B; always when off. */
+static int ab_arm_b(void)
+{
+    return !ab_blk() || (int)((s_presents / (uint64_t)s_ab_n) & 1u);
+}
+
 static int nd_mode(void)
 {
     if (s_nd_mode < 0) {
@@ -298,7 +335,7 @@ static void nd_decide(const struct nv2a_pb_vsh *v, const PsConsts *pc, int w)
             s_nd_elig = 0;
     if (w && v->rc_set && (v->rc_ctl & 0xFF) && ((v->zminmax_ctl >> 4) & 0xFu) == 0u)
         s_nd_elig = 0;
-    s_nd = s_nd_elig;
+    s_nd = s_nd_elig && ab_arm_b();   /* d3d11_ab_alt: arm A takes none */
 }
 
 /* A draw that reaches the GPU (gq_draw's site). w: its shader writes
@@ -704,6 +741,44 @@ static double sh_now_ms(void)
     return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
+/* RECOMP_DEBUG=d3d11_ab_alt: after Present. The frame time is the host
+ * interval between consecutive Presents; the one ending at flip i
+ * (s_presents i + 1 here) counts in flip i's block, so block 0 holds N - 1
+ * and every other block N. A block's line when its last flip is presented. */
+static double s_ab_iv[AB_MAX];
+static int    s_ab_ivn, s_ab_have;
+static double s_ab_t0, s_ab_last;   /* sh_now_ms: block start, last Present */
+
+static void ab_flip(void)
+{
+    double t, p50 = 0, p95 = 0;
+    uint64_t k;
+
+    if (!ab_blk())
+        return;
+    t = sh_now_ms();
+    if (s_ab_have) {
+        if (s_ab_ivn < AB_MAX)
+            s_ab_iv[s_ab_ivn++] = t - s_ab_last;
+    } else {
+        s_ab_have = 1;
+        s_ab_t0 = t;
+    }
+    s_ab_last = t;
+    if (s_presents % (uint64_t)s_ab_n)
+        return;
+    k = (s_presents - 1) / (uint64_t)s_ab_n;
+    if (s_ab_ivn) {
+        qsort(s_ab_iv, (size_t)s_ab_ivn, sizeof s_ab_iv[0], gq_cmp);
+        p50 = s_ab_iv[(s_ab_ivn * 50) / 100];
+        p95 = s_ab_iv[(s_ab_ivn * 95) / 100];
+    }
+    fprintf(stderr, LOGP "ab_alt block %llu arm %c: flips %d in %.1f ms, frame p50 %.3f p95 %.3f ms\n",
+            (unsigned long long)k, (k & 1u) ? 'B' : 'A', s_ab_ivn, t - s_ab_t0, p50, p95);
+    s_ab_ivn = 0;
+    s_ab_t0 = t;
+}
+
 /* The DLL's VS_FIXEDFILEINFO file version, read from the loaded module's
  * own resource (no version.dll): a replacement that keeps the old file's
  * size and time still changes this. 0 when there is none. */
@@ -1062,6 +1137,7 @@ static int init(void)
         ID3D10Blob_Release(code);
     }
     (void)nd_mode();   /* RECOMP_DEBUG=d3d11_nodiscard: its line at start */
+    (void)ab_blk();    /* RECOMP_DEBUG=d3d11_ab_alt: its line at start */
 
     create_black_texture();
     fprintf(stderr, LOGP "device up: feature level 0x%X, swap chain %ux%u\n",
@@ -7256,6 +7332,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     hr = IDXGISwapChain_Present(s_swap, s_sync_interval, s_sync_interval ? 0 : s_present_flags);
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
+    ab_flip();   /* RECOMP_DEBUG=d3d11_ab_alt: the frame time, a block's line */
     if (gq_on())
         gq_flip();
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
