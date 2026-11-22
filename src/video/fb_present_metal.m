@@ -68,6 +68,7 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <os/lock.h>                /* os_unfair_lock: vblank_anchor's estimate */
 
 #include "kernel/nv2a_backend_common.h"
 #ifdef XBOXRECOMP_ENHANCE
@@ -77,6 +78,8 @@
 #include "librashader.h"
 #endif
 #include "fb_present_metal.h"
+#include "kernel/kernel_pacing.h"   /* vblank_anchor: the refresh estimate's hook */
+#include "platform/host_time.h"     /* xbox_HostNowNs: the timer thread's clock */
 #include "metal_compile.h"
 #include "recomp_env.h"
 #include "recomp_exit_hook.h"
@@ -129,6 +132,153 @@ static struct mstall {
     double next;             /* the next one is due (CACurrentMediaTime) */
     unsigned count;          /* stalls so far, for #k */
 } s_ms;
+/* RECOMP_DEBUG=vblank_anchor=<us> (probe, KFC; kernel_pacing.h): the
+ * display's real refresh, for the emulated vblank's grid. on is 0 while it is
+ * off: no presented handler is added. Each shown drawable's presentedTime
+ * (CACurrentMediaTime's clock, CLOCK_UPTIME_RAW) goes into a ring of the
+ * last VA_RING. Consecutive times are k refreshes of 60 Hz apart, k =
+ * round(gap / nominal) (a 30 fps title presents every second refresh): the
+ * ring carries each time's refresh index, and a least-squares line through
+ * (index, time) is the refresh period and phase. A gap that is not near a
+ * whole number of refreshes (another rate, VRR) or longer than VA_GAP_NS
+ * starts the ring again. The fit is valid with VA_MIN times or more, a
+ * period within 1% of 60 Hz and a residual RMS under VA_RMS_NS; the kernel
+ * holds it to 0.02 Hz. The presented handler runs on a Metal thread; the
+ * timer thread reads it through fb_vblank_phase_ns, both under the lock.
+ * Process-wide, never freed: a handler can run after fbm_destroy. */
+#define VA_RING     128
+#define VA_MIN      32
+#define VA_NOMINAL_NS (1e9 / 60.0)
+#define VA_GAP_NS   1000000000ull   /* 1 s without a shown drawable: again */
+#define VA_STALE_NS 250000000ull    /* the newest older than this: no estimate */
+#define VA_RMS_NS   500000.0
+struct va_est {
+    uint64_t t[VA_RING];     /* presentedTime, ns, a ring */
+    int64_t k[VA_RING];      /* each one's refresh index */
+    unsigned n, head;        /* times held, next to write */
+    uint64_t last_t;         /* the newest time */
+    int64_t last_k;          /* ... its index */
+    int valid;               /* the fit below holds */
+    double period_ns;
+    uint64_t phase_ns;       /* the fitted time of the newest refresh */
+    double rms_ns;
+    unsigned resets;
+};
+static struct {
+    int on;                  /* set once in fbm_create */
+    os_unfair_lock lock;     /* zero is OS_UNFAIR_LOCK_INIT */
+    struct va_est e;
+} s_va;
+
+/* The least-squares line through the ring's (index, time), relative to its
+ * oldest entry so the doubles stay small. */
+static void va_fit(struct va_est *v)
+{
+    unsigned i, n = v->n, first = (v->head + VA_RING - v->n) % VA_RING;
+    uint64_t t0 = v->t[first];
+    int64_t k0 = v->k[first];
+    double mx = 0, my = 0, sxx = 0, sxy = 0, ss = 0, b, a, x, y, e;
+
+    v->valid = 0;
+    if (n < VA_MIN)
+        return;
+    for (i = 0; i < n; i++) {
+        unsigned j = (first + i) % VA_RING;
+        mx += (double)(v->k[j] - k0);
+        my += (double)(v->t[j] - t0);
+    }
+    mx /= n;
+    my /= n;
+    for (i = 0; i < n; i++) {
+        unsigned j = (first + i) % VA_RING;
+        x = (double)(v->k[j] - k0) - mx;
+        y = (double)(v->t[j] - t0) - my;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    if (!(sxx > 0))
+        return;
+    b = sxy / sxx;
+    a = my - b * mx;
+    for (i = 0; i < n; i++) {
+        unsigned j = (first + i) % VA_RING;
+        e = (double)(v->t[j] - t0) - (a + b * (double)(v->k[j] - k0));
+        ss += e * e;
+    }
+    v->rms_ns = sqrt(ss / n);
+    if (fabs(b - VA_NOMINAL_NS) > VA_NOMINAL_NS * 0.01 || v->rms_ns > VA_RMS_NS)
+        return;
+    v->period_ns = b;
+    v->phase_ns = t0 + (uint64_t)llround(a + b * (double)(v->last_k - k0));
+    v->valid = 1;
+}
+
+/* One shown drawable's presentedTime, in ns. */
+static void va_add(struct va_est *v, uint64_t t)
+{
+    if (v->n) {
+        double d, kk;
+        if (t <= v->last_t)
+            return;                      /* an older one, late: keep the order */
+        d = (double)(t - v->last_t);
+        kk = floor(d / VA_NOMINAL_NS + 0.5);
+        if (t - v->last_t > VA_GAP_NS || kk < 1
+            || fabs(d - kk * VA_NOMINAL_NS) > VA_NOMINAL_NS / 4) {
+            v->n = 0;                    /* not a 60 Hz grid, or a gap */
+            v->resets++;
+        } else {
+            v->last_k += (int64_t)kk;
+        }
+    }
+    if (!v->n) {
+        v->head = 0;
+        v->last_k = 0;
+    }
+    v->last_t = t;
+    v->t[v->head] = t;
+    v->k[v->head] = v->last_k;
+    v->head = (v->head + 1) % VA_RING;
+    if (v->n < VA_RING)
+        v->n++;
+    va_fit(v);
+}
+
+static void va_note(double presented)
+{
+    if (!(presented > 0))
+        return;                          /* dropped: never on screen */
+    os_unfair_lock_lock(&s_va.lock);
+    va_add(&s_va.e, (uint64_t)(presented * 1e9 + 0.5));
+    os_unfair_lock_unlock(&s_va.lock);
+}
+
+/* XboxVblankPhaseFn (kernel_pacing.h): the fitted newest refresh moved to
+ * xbox_HostNowNs's clock (CLOCK_MONOTONIC, which runs on through a sleep:
+ * the two are read back to back here, never cached), and the period. */
+int fb_vblank_phase_ns(uint64_t *phase_ns, uint64_t *period_ns);
+int fb_vblank_phase_ns(uint64_t *phase_ns, uint64_t *period_ns)
+{
+    uint64_t ph, last, up, host;
+    double per;
+    int ok;
+
+    os_unfair_lock_lock(&s_va.lock);
+    ok = s_va.e.valid;
+    ph = s_va.e.phase_ns;
+    last = s_va.e.last_t;
+    per = s_va.e.period_ns;
+    os_unfair_lock_unlock(&s_va.lock);
+    if (!ok)
+        return 0;
+    up = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    host = xbox_HostNowNs();
+    if (up < last || up - last > VA_STALE_NS)
+        return 0;
+    /* ph may be a little after up (the fit's residual): signed. */
+    *phase_ns = host - (uint64_t)((int64_t)(up - ph));
+    *period_ns = (uint64_t)llround(per);
+    return 1;
+}
 #ifdef XBOXRECOMP_ENHANCE
 static id<MTLRenderPipelineState>  s_pso_lines; /* present.shader: guest-line resolve */
 static id<MTLRenderPipelineState>  s_pso_ovl;  /* the overlay, premultiplied */
@@ -336,6 +486,19 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             } else if (sms != 0) {
                 fprintf(stderr, "[PRESENT] metal_stall=%s: not 1 to 1000 ms, off\n",
                         recomp_env(RENV_METAL_STALL));
+            }
+        }
+        /* RECOMP_DEBUG=vblank_anchor=<us>: read once, here; the kernel reads
+         * the offset itself and logs it */
+        if (recomp_env_int(RENV_VBLANK_ANCHOR, 0) != 0 && !s_va.on) {
+            if (@available(macOS 10.15.4, *)) {
+                s_va.on = 1;
+                xbox_VblankPhaseSetSource(fb_vblank_phase_ns);
+                fprintf(stderr, "[PRESENT] vblank_anchor: the real refresh from each"
+                        " shown drawable's presentedTime\n");
+            } else {
+                fprintf(stderr, "[PRESENT] vblank_anchor: no addPresentedHandler"
+                        " before macOS 10.15.4: no refresh estimate\n");
             }
         }
         s_layer.allowsNextDrawableTimeout = YES;
@@ -1696,6 +1859,14 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
             pr->t_drw = t_drw;
             pr->t_cmt = CACurrentMediaTime();
             pace_handlers(pr, d, cb);   /* before presentDrawable and the commit */
+        }
+        if (s_va.on) {
+            /* vblank_anchor: every present's own handler, whatever the trace */
+            if (@available(macOS 10.15.4, *)) {
+                [d addPresentedHandler:^(id<MTLDrawable> dr) {
+                    va_note([dr presentedTime]);
+                }];
+            }
         }
         [cb presentDrawable:d];
         [cb commit];

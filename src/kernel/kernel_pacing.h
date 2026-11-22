@@ -28,10 +28,39 @@ extern "C" {
  * the caller's sleep granularity. A caller more than 100 ms behind (a
  * debugger stop, a stalled timer thread) restarts the grid at now instead of
  * firing the missed vblanks in a burst. */
+
+/* RECOMP_DEBUG=vblank_anchor=<us> (probe; unset or 0: off, and nothing but
+ * one cached load per vblank). The grid above runs on the host clock from
+ * t0, so it slides slowly against the display's real refresh, and the age
+ * of a frame (commit to screen) slides with it. With the probe, a refresh
+ * estimate from the present path (xbox_VblankPhaseSetSource) puts each
+ * emulated vblank <us> after an estimated refresh: after each vblank the
+ * grid's epoch t0 moves a quarter of the way there, at most
+ * XBOX_VBLANK_ANCHOR_STEP_NS a vblank, so no vblank is lost or doubled and
+ * the rate is the display's. A refresh period further than
+ * XBOX_VBLANK_ANCHOR_TOL_HZ from the vblank rate (59.94 Hz, VRR,
+ * RECOMP_VBLANK_HZ other than the display's), a stale estimate or none
+ * (D3D11: no source) leave the grid as it is. State of the timer thread's
+ * one schedule, so it lives there. */
+typedef struct {
+    int      read;            /* the probe's value was read */
+    long     offset_us;       /* 0: off */
+    uint64_t win_t0_ns;       /* the report window's start */
+    uint64_t win_vblanks, win_anchored;
+    int64_t  total_ns;        /* t0's correction since the start */
+    int64_t  win_ns;          /* ... in this window */
+    double   win_abs_err_ns;  /* sum of |error| over the anchored vblanks */
+    double   win_max_err_ns;
+    uint64_t period_ns;       /* the last estimate seen, for the report */
+    int64_t  edge_ns;         /* the next edge after its refresh, after the move */
+    int      why;             /* the last free vblank's reason (pacing.c) */
+} XboxVblankAnchor;
+
 typedef struct {
     int      started;
     uint64_t t0_ns;      /* the grid's epoch */
     uint64_t count;      /* vblanks fired since t0 */
+    XboxVblankAnchor anchor;
 } XboxVblankSchedule;
 
 #define XBOX_VBLANK_HZ          60u
@@ -47,6 +76,26 @@ int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
 /* The edge of the vblank the last call that returned 1 fired: now minus
  * this is how far behind the grid it was raised (0 after a restart). */
 uint64_t xbox_VblankScheduleLastDue(const XboxVblankSchedule *s);
+
+#define XBOX_VBLANK_ANCHOR_STEP_NS   500000       /* the most t0 moves a vblank */
+#define XBOX_VBLANK_ANCHOR_TOL_HZ    0.02         /* refresh vs vblank rate */
+#define XBOX_VBLANK_ANCHOR_REPORT_NS 10000000000ull
+
+/* The refresh estimate: 1 with the time of a recent real refresh (*phase_ns,
+ * on xbox_HostNowNs's clock) and the refresh period, 0 without a valid one.
+ * The Metal present (fb_present_metal.m, fb_vblank_phase_ns) registers its
+ * own at window creation when vblank_anchor is set; nothing else does, so
+ * without one (D3D11, the tests) xbox_VblankPhaseNs returns 0. */
+typedef int (*XboxVblankPhaseFn)(uint64_t *phase_ns, uint64_t *period_ns);
+void xbox_VblankPhaseSetSource(XboxVblankPhaseFn fn);
+int  xbox_VblankPhaseNs(uint64_t *phase_ns, uint64_t *period_ns);
+
+/* After a call to xbox_VblankSchedule that returned 1 (the timer thread):
+ * with vblank_anchor set, move the grid toward the refresh estimate and
+ * set *next_due_ns to the moved next edge; a [PACING] vblank_anchor: line
+ * every 10 s. With the probe off, one load and nothing else. */
+void xbox_VblankAnchorStep(XboxVblankSchedule *s, uint64_t now_ns,
+                           uint64_t *next_due_ns);
 
 /* ── The pacing mode ── */
 enum { XBOX_PACING_SPIN = 0, XBOX_PACING_SLEEP = 1 };

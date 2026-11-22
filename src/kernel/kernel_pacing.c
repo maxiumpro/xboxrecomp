@@ -86,6 +86,119 @@ uint64_t xbox_VblankScheduleLastDue(const XboxVblankSchedule *s)
     return vblank_due(s, s->count ? s->count - 1u : 0u);
 }
 
+/* ── RECOMP_DEBUG=vblank_anchor (kernel_pacing.h) ────────── */
+
+static XboxVblankPhaseFn s_phase_src;   /* set once, at window creation */
+
+void xbox_VblankPhaseSetSource(XboxVblankPhaseFn fn)
+{
+    __atomic_store_n(&s_phase_src, fn, __ATOMIC_RELEASE);
+}
+
+int xbox_VblankPhaseNs(uint64_t *phase_ns, uint64_t *period_ns)
+{
+    XboxVblankPhaseFn fn = __atomic_load_n(&s_phase_src, __ATOMIC_ACQUIRE);
+    return fn ? fn(phase_ns, period_ns) : 0;
+}
+
+enum { ANCHOR_OK, ANCHOR_NO_ESTIMATE, ANCHOR_OFF_RATE };
+
+static void anchor_report(XboxVblankAnchor *a, uint64_t now_ns)
+{
+    static const char *const why[] = { "-", "no refresh estimate",
+                                       "refresh period off the vblank rate" };
+    double win_s = (double)(now_ns - a->win_t0_ns) / 1e9;
+    uint64_t freev = a->win_vblanks - a->win_anchored;
+    char edge[24] = "-";
+
+    /* The phase: where the grid's next edge sits after its refresh. */
+    if (a->win_anchored)
+        snprintf(edge, sizeof edge, "%.3f", a->edge_ns / 1e6);
+    fprintf(stderr, "[PACING] vblank_anchor: period %.3f us (%.4f Hz), edge"
+            " %s ms after the refresh (target %ld us), error mean %.3f max"
+            " %.3f ms, correction total %+.3f ms (window %+.3f), vblanks/s"
+            " %.3f, anchored %llu free %llu%s%s%s\n",
+            a->period_ns / 1e3, a->period_ns ? 1e9 / (double)a->period_ns : 0.0,
+            edge, a->offset_us,
+            a->win_anchored ? a->win_abs_err_ns / (double)a->win_anchored / 1e6 : 0.0,
+            a->win_max_err_ns / 1e6, a->total_ns / 1e6, a->win_ns / 1e6,
+            win_s > 0 ? (double)a->win_vblanks / win_s : 0.0,
+            (unsigned long long)a->win_anchored, (unsigned long long)freev,
+            freev ? " (last free: " : "", freev ? why[a->why] : "",
+            freev ? ")" : "");
+    fflush(stderr);
+    a->win_t0_ns = now_ns;
+    a->win_vblanks = a->win_anchored = 0;
+    a->win_ns = 0;
+    a->win_abs_err_ns = a->win_max_err_ns = 0;
+}
+
+void xbox_VblankAnchorStep(XboxVblankSchedule *s, uint64_t now_ns,
+                           uint64_t *next_due_ns)
+{
+    XboxVblankAnchor *a = &s->anchor;
+    uint64_t phase, period, next;
+    int64_t nominal, tol, offset, rel, r, move;
+    int first = !a->read;   /* starts the first window: not counted in it */
+
+    if (first) {
+        a->read = 1;
+        a->offset_us = recomp_env_int(RENV_VBLANK_ANCHOR, 0);
+        a->win_t0_ns = now_ns;
+        if (a->offset_us)
+            fprintf(stderr, "[PACING] vblank_anchor: on, each emulated vblank"
+                    " %ld us after the estimated real refresh (at most %d us"
+                    " of grid move a vblank; a line every 10 s)\n",
+                    a->offset_us, XBOX_VBLANK_ANCHOR_STEP_NS / 1000);
+    }
+    if (!a->offset_us)
+        return;
+    if (!first)
+        a->win_vblanks++;
+    nominal = (int64_t)(1000000000ull / vblank_hz());
+    /* 60 +- 0.02 Hz: about +-5.6 us of period. */
+    tol = (int64_t)(1e9 / ((double)vblank_hz() - XBOX_VBLANK_ANCHOR_TOL_HZ))
+          - nominal;
+    if (!xbox_VblankPhaseNs(&phase, &period) || !period) {
+        a->why = ANCHOR_NO_ESTIMATE;
+    } else if ((int64_t)period < nominal - tol || (int64_t)period > nominal + tol) {
+        a->period_ns = period;
+        a->why = ANCHOR_OFF_RATE;
+    } else {
+        a->period_ns = period;
+        offset = (int64_t)a->offset_us * 1000;
+        next = vblank_due(s, s->count);
+        /* The next edge against the target grid (phase + offset + k * T),
+         * folded into [-T/2, T/2): the move that would put it on the
+         * nearest target is -r. */
+        rel = (int64_t)(next - phase) - offset;
+        r = rel % (int64_t)period;
+        if (r < 0)
+            r += (int64_t)period;
+        if (2 * r >= (int64_t)period)
+            r -= (int64_t)period;
+        move = -r / 4;
+        if (move > XBOX_VBLANK_ANCHOR_STEP_NS)
+            move = XBOX_VBLANK_ANCHOR_STEP_NS;
+        else if (move < -XBOX_VBLANK_ANCHOR_STEP_NS)
+            move = -XBOX_VBLANK_ANCHOR_STEP_NS;
+        s->t0_ns += (uint64_t)move;   /* two's complement: a negative move too */
+        *next_due_ns = vblank_due(s, s->count);
+        a->total_ns += move;
+        a->win_ns += move;
+        a->win_anchored++;
+        a->win_abs_err_ns += (double)(r < 0 ? -r : r);
+        if ((double)(r < 0 ? -r : r) > a->win_max_err_ns)
+            a->win_max_err_ns = (double)(r < 0 ? -r : r);
+        a->edge_ns = offset + r + move;
+        a->edge_ns %= (int64_t)period;
+        if (a->edge_ns < 0)
+            a->edge_ns += (int64_t)period;
+    }
+    if (now_ns - a->win_t0_ns >= XBOX_VBLANK_ANCHOR_REPORT_NS)
+        anchor_report(a, now_ns);
+}
+
 /* ── Mode and the wait ───────────────────────────────────── */
 
 #define SPIN_TIMEOUT_MS 1

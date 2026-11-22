@@ -4015,6 +4015,10 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
         xbox_ProfCount(XBOX_PROF_SCHED_RESTART, (long long)(late / 1000000u));
     kernel_vblank_behind(late ? late
                               : now_ns - xbox_VblankScheduleLastDue(&sched));
+    /* RECOMP_DEBUG=vblank_anchor: the grid toward the real refresh, after
+     * the lateness above (it reads the edge this vblank fired on) and with
+     * *next_due_ns moved with it; off, one load. */
+    xbox_VblankAnchorStep(&sched, now_ns, next_due_ns);
     kernel_vblank_count(kernel_clock_ms());
     xbox_PacingVblank(now_ns);
     kernel_vblank_raise();
