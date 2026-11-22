@@ -3550,14 +3550,21 @@ static TexEntry *tc_hinted(uint32_t slot, const Stage *t, int cube)
     return NULL;
 }
 
-/* fs_select_body's key[38] -> its s_fsd slot (word-wise, cheap). */
+/* fs_select_body's key[38] -> its s_fsd slot (word-wise, cheap; the
+ * finalizer folds each word's top bits, the combiner inputs' mapping and
+ * register high bits, into the low ones the slot takes). */
 static FsdSlot *fsd_slot(const uint32_t *key)
 {
     uint32_t h = 0x811c9dc5u;
     int i;
     for (i = 0; i < 38; i++)
         h = (h ^ key[i]) * 0x01000193u;
-    return &s_fsd[(h ^ (h >> 16)) & (FSD_SLOTS - 1)];
+    h ^= h >> 16;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return &s_fsd[h & (FSD_SLOTS - 1)];
 }
 
 /* At each flip, after s_presents++ (metal_flip): alt's block line, with
