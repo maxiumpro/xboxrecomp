@@ -2311,7 +2311,12 @@ static int init(void)
         if (s_inflight > 1)
             fprintf(stderr, LOGP "metal_inflight=2: the flip commits the frame without waiting;"
                     " at the end of flip N the CPU waits for flip N-1's work\n");
-        s_cf_mode = recomp_env_on(RENV_METAL_CLEAR_FOLD);
+        {   /* =alt (2): only the clears of even flips are held, an in-run A/B for image parity */
+            const char *cf = recomp_env(RENV_METAL_CLEAR_FOLD);
+            s_cf_mode = !cf ? 0 : !strcasecmp(cf, "alt") ? 2 : recomp_env_on(RENV_METAL_CLEAR_FOLD) ? 1 : 0;
+        }
+        if (s_cf_mode == 2)
+            fprintf(stderr, LOGP "KFC-1105: metal_clear_fold=alt: as =1 on even flips only\n");
         if (s_cf_mode)
             fprintf(stderr, LOGP "KFC-1105: metal_clear_fold=1: a whole-target colour clear or a"
                     " depth clear opens no pass; it becomes the Clear load actions of the next pass"
@@ -2984,7 +2989,7 @@ static void metal_on_clear(uint32_t param)
         s_clears++;
         if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
             PT_WHY(PT_CLEAR);
-            s_cf_call = s_cf_mode;   /* metal_clear_fold: it may be held */
+            s_cf_call = s_cf_mode == 1 || (s_cf_mode == 2 && !(s_presents & 1));   /* metal_clear_fold: it may be held */
             begin_encoder(rt, 1, c);
             s_cf_call = 0;
             return;
@@ -3071,7 +3076,7 @@ static void metal_on_zclear(uint32_t param)
         if (dt->earlyz)
             z = nv2a_w_earlyz_clear(z, nv2a_zmax(g->format), nv2a_w_earlyz_b());
         PT_WHY(PT_ZCLEAR);
-        s_cf_call = s_cf_mode;   /* metal_clear_fold: it may be held */
+        s_cf_call = s_cf_mode == 1 || (s_cf_mode == 2 && !(s_presents & 1));   /* metal_clear_fold: it may be held */
         begin_pass(rt, 0, NULL, param & 3u, z, v->zclear & 0xFFu);
         s_cf_call = 0;
         if (param & 1u)
