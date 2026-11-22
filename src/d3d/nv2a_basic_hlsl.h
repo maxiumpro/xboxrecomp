@@ -59,8 +59,12 @@
 /* Batches without register combiners: the CPU path's MODULATE, oD0 * T0
  * when stage 0 is on, a CLIPPLANE stage 0's kill, then the alpha test
  * (D3DCMP numbering, on the 8-bit values the way the CPU compares them).
- * SNAP is the snap helpers' text, SAMPLE stage 0's sample into t. */
-#define PS_BASIC_SRC(SNAP, SAMPLE) \
+ * SNAP is the snap helpers' text, SAMPLE stage 0's sample into t, KILLS
+ * the kill and the alpha test (PS_BASIC_KILLS; "" for RECOMP_DEBUG=
+ * d3d11_nodiscard's variants, PS_BASIC_SRC_ND). */
+#define PS_BASIC_SRC(SNAP, SAMPLE) PS_BASIC_SRC_K(SNAP, SAMPLE, PS_BASIC_KILLS)
+#define PS_BASIC_SRC_ND(SNAP, SAMPLE) PS_BASIC_SRC_K(SNAP, SAMPLE, "")
+#define PS_BASIC_SRC_K(SNAP, SAMPLE, KILLS) \
     VS_OUT_DECL \
     PS_CB_DECL \
     SNAP \
@@ -78,6 +82,11 @@
     "        if (alpha_only.x == 2u) t.a = 1.0;\n" \
     "        c *= t;\n" \
     "    }\n" \
+    KILLS \
+    "    return c;\n" \
+    "}\n"
+
+#define PS_BASIC_KILLS \
     "    if (nv2a_clip_kills(clip_mode.x, i.oT0)) discard;\n" \
     "    if (alpha_test_enable != 0u) {\n" \
     "        uint a = (uint)(saturate(c.a) * 255.0 + 0.5), r = (uint)(alpha_ref * 255.0 + 0.5);\n" \
@@ -90,26 +99,31 @@
     "        else if (alpha_func == 6u) ok = a != r;\n" \
     "        else if (alpha_func == 7u) ok = a >= r;\n" \
     "        if (!ok) discard;\n" \
-    "    }\n" \
-    "    return c;\n" \
-    "}\n"
+    "    }\n"
 
 /* tex_scale.w: the hor+ offset into a padded target, 0 otherwise */
-#define NV2A_HLSL_PS_BASIC PS_BASIC_SRC( \
-    D3D8_HLSL_SNAP_UV, \
+#define PS_BASIC_SAMPLE \
     "        uv = nv2a_snap_uv(uv, i.oPos.xy, tex_scale[0]);\n" \
-    "        float4 t = tex0.Sample(samp0, uv * tex_scale[0].xy + float2(tex_scale[0].w, 0.0));\n")
+    "        float4 t = tex0.Sample(samp0, uv * tex_scale[0].xy + float2(tex_scale[0].w, 0.0));\n"
+#define NV2A_HLSL_PS_BASIC PS_BASIC_SRC(D3D8_HLSL_SNAP_UV, PS_BASIC_SAMPLE)
 
 /* render.snap_2d's (nv2a_snap_2d_on), built when it first draws: a
  * 2D-snapped stage (.z < 0) samples with the 1x gradients (nv2a_snap_grad).
  * The stock s_ps_src keeps its text, gradients and branch left out. */
-#define NV2A_HLSL_PS_BASIC_SNAP PS_BASIC_SRC( \
-    D3D8_HLSL_SNAP_UV D3D8_HLSL_SNAP_2D, \
+#define PS_BASIC_SAMPLE_SNAP \
     "        float4 g = nv2a_snap_grad(uv, tex_scale[0]) * tex_scale[0].xyxy;\n" \
     "        uv = nv2a_snap_uv2d(uv, i.oPos.xy, tex_scale[0]);\n" \
     "        uv = uv * tex_scale[0].xy + float2(tex_scale[0].w, 0.0);\n" \
     "        float4 t;\n" \
     "        if (tex_scale[0].z < 0.0) t = tex0.SampleGrad(samp0, uv, g.xy, g.zw);\n" \
-    "        else t = tex0.Sample(samp0, uv);\n")
+    "        else t = tex0.Sample(samp0, uv);\n"
+#define NV2A_HLSL_PS_BASIC_SNAP PS_BASIC_SRC(D3D8_HLSL_SNAP_UV D3D8_HLSL_SNAP_2D, \
+                                             PS_BASIC_SAMPLE_SNAP)
+
+/* RECOMP_DEBUG=d3d11_nodiscard (KFC-2100): the two without the CLIPPLANE
+ * kill and the alpha test, for a draw where neither can fire. */
+#define NV2A_HLSL_PS_BASIC_ND PS_BASIC_SRC_ND(D3D8_HLSL_SNAP_UV, PS_BASIC_SAMPLE)
+#define NV2A_HLSL_PS_BASIC_SNAP_ND PS_BASIC_SRC_ND(D3D8_HLSL_SNAP_UV D3D8_HLSL_SNAP_2D, \
+                                                   PS_BASIC_SAMPLE_SNAP)
 
 #endif

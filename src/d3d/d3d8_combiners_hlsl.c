@@ -457,25 +457,28 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    }\n");
 
     /* ---- CLIPPLANE stages: the coordinate's four plane distances ---- */
-    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+    /* (no_discard 1, RECOMP_DEBUG=d3d11_nodiscard: neither these kills nor
+     * the alpha test's nor wkill; 2, its null control, keeps all three) */
+    for (i = 0; i < NV2A_MAX_TEXTURES && state->no_discard != 1; i++)
         if ((int)state->tex_mode[i] == NV2A_TEXMODE_CLIPPLANE)
             EMIT("    if (nv2a_clip_kills(clip_mode[%d], i.tc%d)) discard;\n", i, i);
 
     /* ---- Alpha test: D3DCMP numbering on 8-bit values ---- */
-    EMIT("    if (alpha_test_enable != 0u) {\n"
-         "        uint a = (uint)(saturate(res.a) * 255.0 + 0.5), r = (uint)(alpha_ref * 255.0 + 0.5);\n"
-         "        bool ok = true;\n"
-         "        if      (alpha_func == 1u) ok = false;\n"
-         "        else if (alpha_func == 2u) ok = a <  r;\n"
-         "        else if (alpha_func == 3u) ok = a == r;\n"
-         "        else if (alpha_func == 4u) ok = a <= r;\n"
-         "        else if (alpha_func == 5u) ok = a >  r;\n"
-         "        else if (alpha_func == 6u) ok = a != r;\n"
-         "        else if (alpha_func == 7u) ok = a >= r;\n"
-         "        if (!ok) discard;\n"
-         "    }\n");
+    if (state->no_discard != 1)
+        EMIT("    if (alpha_test_enable != 0u) {\n"
+             "        uint a = (uint)(saturate(res.a) * 255.0 + 0.5), r = (uint)(alpha_ref * 255.0 + 0.5);\n"
+             "        bool ok = true;\n"
+             "        if      (alpha_func == 1u) ok = false;\n"
+             "        else if (alpha_func == 2u) ok = a <  r;\n"
+             "        else if (alpha_func == 3u) ok = a == r;\n"
+             "        else if (alpha_func == 4u) ok = a <= r;\n"
+             "        else if (alpha_func == 5u) ok = a >  r;\n"
+             "        else if (alpha_func == 6u) ok = a != r;\n"
+             "        else if (alpha_func == 7u) ok = a >= r;\n"
+             "        if (!ok) discard;\n"
+             "    }\n");
     if (state->w_depth)
-        EMIT("%s", D3D8_HLSL_WDEPTH_END);
+        EMIT("%s", state->no_discard == 1 ? D3D8_HLSL_WDEPTH_OUT : D3D8_HLSL_WDEPTH_END);
     else
         EMIT("    return res;\n");
     EMIT("}\n");

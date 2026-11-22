@@ -146,6 +146,10 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
 
 #define D3D8_HLSL_WDEPTH_END \
     "    if (wkill) discard;\n" \
+    D3D8_HLSL_WDEPTH_OUT
+/* END without the kill: NV2ACombinerState.no_discard 1 (RECOMP_DEBUG=
+ * d3d11_nodiscard), taken in clamp mode, where wkill is always false. */
+#define D3D8_HLSL_WDEPTH_OUT \
     "    PS_OUT o;\n" \
     "    o.c = res;\n" \
     "    o.d = wd1.w != 0.0 ? saturate(wd1.z / zv - wd1.z * wd1.x)\n" \

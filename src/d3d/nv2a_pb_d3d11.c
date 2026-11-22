@@ -245,6 +245,75 @@ static uint64_t s_tex_mip_uploads;   /* uploads with more than one level */
 static uint64_t s_vb_native, s_vb_expanded;  /* vertex bytes copied / made */
 static uint64_t s_draws_prog, s_draws_tex;   /* with a vertex program / a texture */
 
+/* ---- RECOMP_DEBUG=d3d11_nodiscard (KFC-2100) ------------------------------
+ *
+ * Metal's metal_nodiscard here: on AMD a pixel shader with discard loses
+ * the early depth test and HiZ, so a draw whose shader can never kill takes
+ * a variant without the discards. Eligible, exactly as nd_decide in
+ * nv2a_pb_metal.m: the alpha test off or ALWAYS (D3DCMP 8, which leaves ok
+ * true), no CLIPPLANE stage (every clip_mode 0, so nv2a_clip_kills is
+ * false), and for the combiners' W variant the clamp mode, where wkill is
+ * false (nv2a_wdepth_consts_fill: wd1.y is 1 only for cull). The alpha test
+ * is a run-time constant, not in the shader's text, so the choice is per
+ * draw and goes into the combiners' memo key (key[36] bit 11) and state
+ * (NV2ACombinerState.no_discard, in rc_hash), and the basic shader has its
+ * own objects (nd_basic_ps). =1: the variant drops the kills; =null: the
+ * null control, the variant is the same text in its own cache entry
+ * (no_discard 2) and its own shader objects: the mechanism's cost. Off:
+ * no_discard stays 0, nothing else is read. Counts per d3d11_gpu window. */
+static int s_nd_mode = -1;   /* 0 off, 1 the variant, 2 the null control */
+static int s_nd;             /* this draw asks for the variant (eligible, mode on) */
+static int s_nd_elig;        /* this draw: none of its kills could fire */
+static int s_nd_taken;       /* this draw's pixel shader is the variant: 1 combiners, 2 basic */
+static struct { uint64_t draws, elig, comb, basic, w; } s_ndc;
+
+static int nd_mode(void)
+{
+    if (s_nd_mode < 0) {
+        const char *e = recomp_env(RENV_D3D11_NODISCARD);
+        s_nd_mode = !e ? 0 : !strcmp(e, "1") ? 1 : !_stricmp(e, "null") ? 2 : 0;
+        if (e && !s_nd_mode && e[0] != '0')
+            fprintf(stderr, LOGP "d3d11_nodiscard=%s: not 1 or null, off\n", e);
+        if (s_nd_mode)
+            fprintf(stderr, LOGP "KFC-2100: d3d11_nodiscard=%s: %s; counts with d3d11_gpu\n", e,
+                    s_nd_mode == 1 ? "a draw that cannot kill takes a pixel shader without discard"
+                                   : "null control, a draw that cannot kill takes its own shader"
+                                     " from the same text, discard kept");
+    }
+    return s_nd_mode;
+}
+
+/* The draw's choice, before its pixel shader is picked. w: the combiners'
+ * W variant is asked for (setup_pixel's w). */
+static void nd_decide(const struct nv2a_pb_vsh *v, const PsConsts *pc, int w)
+{
+    int k;
+
+    s_nd = s_nd_elig = 0;
+    if (!nd_mode())
+        return;
+    s_nd_elig = !pc->alpha_test_enable || pc->alpha_func == 8u;
+    for (k = 0; k < 4; k++)
+        if (pc->clip_mode[k])
+            s_nd_elig = 0;
+    if (w && v->rc_set && (v->rc_ctl & 0xFF) && ((v->zminmax_ctl >> 4) & 0xFu) == 0u)
+        s_nd_elig = 0;
+    s_nd = s_nd_elig;
+}
+
+/* A draw that reaches the GPU (gq_draw's site). w: its shader writes
+ * SV_Depth (the W variant), no early depth with or without discard. */
+static void nd_count(int w)
+{
+    if (!s_nd_mode)
+        return;
+    s_ndc.draws++;
+    s_ndc.elig += (uint64_t)(s_nd_elig != 0);
+    s_ndc.comb += (uint64_t)(s_nd_taken == 1);
+    s_ndc.basic += (uint64_t)(s_nd_taken == 2);
+    s_ndc.w += (uint64_t)(s_nd_taken && w);
+}
+
 /* ---- RECOMP_TRACE=d3d11_gpu: the frame's GPU time ------------------------
  *
  * What a frame of Kung Fu Chaos costs the GPU here, to set beside Metal's
@@ -437,6 +506,15 @@ static void gq_flip(void)
                 " %llu disjoint)\n", s_gqs.flips, (unsigned long long)s_gqs.dropped,
                 (unsigned long long)s_gqs.disjoint);
     }
+    if (s_nd_mode > 0)   /* RECOMP_DEBUG=d3d11_nodiscard */
+        fprintf(stderr, LOGP "nodiscard%s over %d flips: %llu draws, %llu eligible, %llu took"
+                " the variant (%llu combiners, %llu basic; %llu of them W, SV_Depth) (flip %llu)\n",
+                s_nd_mode == 2 ? " (null)" : "", s_gqs.flips,
+                (unsigned long long)s_ndc.draws, (unsigned long long)s_ndc.elig,
+                (unsigned long long)(s_ndc.comb + s_ndc.basic), (unsigned long long)s_ndc.comb,
+                (unsigned long long)s_ndc.basic, (unsigned long long)s_ndc.w,
+                (unsigned long long)s_presents);
+    memset(&s_ndc, 0, sizeof s_ndc);
     memset(&s_gqs, 0, sizeof s_gqs);
 }
 
@@ -766,6 +844,9 @@ static ID3D11Buffer *make_buffer(UINT size, UINT bind)
  * render.snap_2d's, built when it first draws (snap_ps). */
 static const char s_ps_src[] = NV2A_HLSL_PS_BASIC;
 static const char s_ps_snap_src[] = NV2A_HLSL_PS_BASIC_SNAP;
+/* RECOMP_DEBUG=d3d11_nodiscard=1: the two without their kills (nd_basic_ps) */
+static const char s_ps_nd_src[] = NV2A_HLSL_PS_BASIC_ND;
+static const char s_ps_snap_nd_src[] = NV2A_HLSL_PS_BASIC_SNAP_ND;
 
 /* Batches without a vertex program (nv2a_basic_hlsl.h). */
 static const char s_vs_passthrough_src[] = NV2A_HLSL_VS_PASS;
@@ -980,6 +1061,7 @@ static int init(void)
                                        &s_ps);
         ID3D10Blob_Release(code);
     }
+    (void)nd_mode();   /* RECOMP_DEBUG=d3d11_nodiscard: its line at start */
 
     create_black_texture();
     fprintf(stderr, LOGP "device up: feature level 0x%X, swap chain %ux%u\n",
@@ -2894,6 +2976,33 @@ static ID3D11PixelShader *snap_ps(void)
     return ps;
 }
 
+/* RECOMP_DEBUG=d3d11_nodiscard: the basic shader's variant, snap (render.
+ * snap_2d's) or not, built the first time it is asked for: =1 the text
+ * without the kills, =null the stock text as a shader object of its own.
+ * NULL when it cannot be built: the caller takes the stock one. */
+static ID3D11PixelShader *nd_basic_ps(int snap)
+{
+    static int tried[2];
+    static ID3D11PixelShader *ps[2];
+    ID3DBlob *code = NULL;
+    const char *src;
+
+    if (tried[snap])
+        return ps[snap];
+    tried[snap] = 1;
+    src = s_nd_mode == 1 ? (snap ? s_ps_snap_nd_src : s_ps_nd_src)
+                         : (snap ? s_ps_snap_src : s_ps_src);
+    if (compile(snap ? "nv2a_ps_diffuse_snap_nd" : "nv2a_ps_diffuse_nd", src, "ps_5_0", &code)) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                       ID3D10Blob_GetBufferSize(code), NULL, &ps[snap]);
+        ID3D10Blob_Release(code);
+    }
+    if (!ps[snap])
+        fprintf(stderr, LOGP "d3d11_nodiscard: the basic%s variant FAILED to build,"
+                " its draws take the stock shader\n", snap ? " snap" : "");
+    return ps[snap];
+}
+
 /* NULL when the shader cannot be built: the caller falls back to s_ps. */
 static ID3D11PixelShader *combiner_ps(const NV2ACombinerState *st)
 {
@@ -3594,6 +3703,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
     unsigned bump_src;
 
     s_ps_w = 0;
+    s_nd_taken = 0;   /* RECOMP_DEBUG=d3d11_nodiscard: set where the variant is returned */
     build_stages();
     stages_cube_rt();
     bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
@@ -3609,6 +3719,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             nv2a_bump_trace(v, s_stage, nv2a_pb_gpu_state()->flips);
     }
     nv2a_ps_consts_fill(v, s_stage, &pc);
+    nd_decide(v, &pc, w);   /* RECOMP_DEBUG=d3d11_nodiscard: s_nd, read below */
     /* The stage loop's views, while nothing they come from has moved: the
      * same decoded stages (s_stage_gen) in the same flip (tex_bind checks
      * the texels once a flip), no texture uploaded or freed and no render
@@ -3885,7 +3996,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
                 | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
                 | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
                 | (mag_shader(d) ? 16u : 0u)    /* the trace's variant */
-                | (lazy_mode == 1 || (lazy_mode == 2 && !(s_presents & 1)) ? 32u : 0u);   /* d3d11_snap_lazy */
+                | (lazy_mode == 1 || (lazy_mode == 2 && !(s_presents & 1)) ? 32u : 0u)   /* d3d11_snap_lazy */
+                | (s_nd ? 2048u : 0u);   /* d3d11_nodiscard: bit 11, Metal's, the draw's choice */
         key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
@@ -3900,6 +4012,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
             st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
             st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
+            /* d3d11_nodiscard: 1 no kills, 2 the null control's own entry */
+            st.no_discard = (key[36] & 2048u) ? s_nd_mode : 0;
             for (n = 0; n < 4; n++) {
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
                 st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -3929,6 +4043,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         }
         if (ps && (!w || st_w_on(w, d))) {
             s_ps_w = w;
+            s_nd_taken = s_last_rc.no_discard ? 1 : 0;   /* d3d11_nodiscard's count */
             return ps;
         }
         if (ps) {
@@ -3940,8 +4055,10 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             st0 = s_last_rc;
             st0.w_depth = 0;
             ps = combiner_ps(&st0);
-            if (ps)
+            if (ps) {
+                s_nd_taken = st0.no_discard ? 1 : 0;   /* d3d11_nodiscard's count */
                 return ps;
+            }
         }
         /* No combiners' shader (no HLSL, a compile failure). */
         stages_flat(flat_mask);
@@ -3952,6 +4069,13 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         ID3D11PixelShader *ps = s_dbg_post ? NULL : debug_ps();
         if (ps)
             return ps;
+    }
+    if (s_nd) {   /* RECOMP_DEBUG=d3d11_nodiscard: the basic shader's variant */
+        ID3D11PixelShader *ps = nd_basic_ps(nv2a_snap_2d_on(nv2a_host_render_scale()) ? 1 : 0);
+        if (ps) {
+            s_nd_taken = 2;
+            return ps;
+        }
     }
     if (nv2a_snap_2d_on(nv2a_host_render_scale())) {
         ID3D11PixelShader *ps = snap_ps();
@@ -5193,8 +5317,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             mag_draw();
         else if (nv2a_tex_mag_on() && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
             mag_pretransformed(d, v, lo, idx, nidx);
-        if (gq_on())
+        if (gq_on()) {
             gq_draw(rt, v->depth_enable);   /* d3d11_gpu: this draw's kind */
+            nd_count(s_ps_w);               /* d3d11_nodiscard's line */
+        }
         if (px_on()) {
             uint32_t before[4];
             int n;
