@@ -2414,13 +2414,19 @@ static void rt_free(RenderTarget *rt);
  * whose megabytes the next level refills with textures and tables) would otherwise
  * get the old image sampled in place of its texels, or written back over
  * them. A stale target is dropped without a write-back. A/B:
- * RECOMP_DEBUG=rt_alias_check=0. */
+ * RECOMP_DEBUG=rt_alias_check=0. =sync (KFC-1830, probe): only the decode
+ * sync (a texture of another base or format over a dirty target that
+ * rt_texture did not bind) drops a stale target, instead of writing it back
+ * over the title's texels; every other check is off, as with =0. */
 static int alias_check_on(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = recomp_env(RENV_RT_ALIAS_CHECK);
-        on = !(e && e[0] == '0');
+        on = !e ? 1 : !strcasecmp(e, "sync") ? 2 : e[0] != '0';
+        if (on == 2)
+            fprintf(stderr, LOGP "KFC-1830: rt_alias_check=sync: a stale target is dropped only"
+                    " at a decode sync, not written back over the texture's bytes\n");
     }
     return on;
 }
@@ -2447,6 +2453,8 @@ static int rt_drop_if_stale(RenderTarget *rt, const char *why)
 
     if (!alias_check_on() || !rt->tex || !rt->pitch)
         return 0;
+    if (alias_check_on() == 2 && strcmp(why, "sync"))
+        return 0;   /* =sync: the other callers keep the target, as with =0 */
     guard_open();
     t = prof_t();
     stale = nv2a_rt_own_stale(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(), rt->addr,
@@ -2863,8 +2871,8 @@ static RenderTarget *surface(void)
     }
     /* No two live targets share memory: one the new target overlaps is
      * written back first (the seed below then reads what was drawn) or,
-     * if the title rewrote it, dropped. */
-    if (alias_check_on()) {
+     * if the title rewrote it, dropped. =sync keeps them, as =0 does. */
+    if (alias_check_on() == 1) {
         uint32_t addr = nv2a_pb_dma_resolve(g->color_offset);
         for (i = 0; i < RT_MAX; i++) {
             RenderTarget *rt = &s_rt[i];
