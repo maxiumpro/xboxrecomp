@@ -596,7 +596,7 @@ static int  s_dc_opener;        /* begin_pass is opened for a draw using neither
  * sampling its target (rt_texture) or a free of its target or depth
  * buffer encodes it first, as it would have been encoded. Held ones never
  * share a texture. s_cf_mode is set by init. */
-#define CF_MAX 4
+#define FOLD_HELD_MAX 4
 typedef struct {
     MTLRenderPassDescriptor *rp;   /* retained; nil: a free entry */
     RenderTarget *rt;
@@ -604,7 +604,7 @@ typedef struct {
     const void   *ctex, *ztex;     /* its textures, identity only */
     int           why, had;        /* begin_pass's, for pt_open when encoded */
 } CfHeld;
-static CfHeld s_cf[CF_MAX];
+static CfHeld s_cf[FOLD_HELD_MAX];
 static int  s_cf_n;             /* entries held */
 static int  s_cf_mode;          /* metal_clear_fold */
 static int  s_cf_call;          /* begin_pass is opened by a whole-target clear */
@@ -1691,7 +1691,7 @@ static void pt_judge(PtFrame *f)
                     " held already\n", s_pts.flips, (unsigned long long)s_pts.cf_held,
                     (unsigned long long)s_pts.cf_merged, (unsigned long long)s_pts.cf_folded,
                     (unsigned long long)s_pts.cf_shared, at ? line : " none",
-                    (unsigned long long)s_pts.cf_query, (unsigned long long)s_pts.cf_full, CF_MAX);
+                    (unsigned long long)s_pts.cf_query, (unsigned long long)s_pts.cf_full, FOLD_HELD_MAX);
         }
         memset(&s_pts, 0, sizeof s_pts);
     }
@@ -1765,7 +1765,7 @@ static void end_encoder(void)
      * now, each closed for this reason. Never set with the switch off. */
     if (s_cf_n && !s_cf_hold) {
         int i;
-        for (i = 0; i < CF_MAX; i++)
+        for (i = 0; i < FOLD_HELD_MAX; i++)
             if (s_cf[i].rp) {
                 s_pts.cf_end[why]++;
                 cf_encode(i, why);
@@ -2113,7 +2113,7 @@ static void cf_spill(int i, int why)
 static void cf_drop(const RenderTarget *rt, const DepthTarget *dt, int why)
 {
     int i;
-    for (i = 0; i < CF_MAX && s_cf_n; i++)
+    for (i = 0; i < FOLD_HELD_MAX && s_cf_n; i++)
         if (s_cf[i].rp && ((rt && s_cf[i].rt == rt) || (dt && s_cf[i].dt == dt)))
             cf_spill(i, why);
 }
@@ -2194,7 +2194,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
      * occlusion query is open or the table is full. Off: s_cf_n is 0. */
     if (s_cf_mode) {
         int i, merged = 0;
-        for (i = 0; i < CF_MAX && s_cf_n; i++) {
+        for (i = 0; i < FOLD_HELD_MAX && s_cf_n; i++) {
             CfHeld *h = &s_cf[i];
             if (!h->rp)
                 continue;
@@ -2220,11 +2220,11 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
             return;
         }
         if (s_cf_call) {
-            for (i = 0; i < CF_MAX && s_cf[i].rp; i++)
+            for (i = 0; i < FOLD_HELD_MAX && s_cf[i].rp; i++)
                 ;
             if (s_occ_q) {
                 s_pts.cf_query++;
-            } else if (i == CF_MAX) {
+            } else if (i == FOLD_HELD_MAX) {
                 s_pts.cf_full++;
             } else {
                 CfHeld *h = &s_cf[i];
