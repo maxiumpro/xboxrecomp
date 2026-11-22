@@ -103,6 +103,23 @@ static uint32_t                   *s_conv;     /* R5G6B5 -> BGRA8 rows */
 static size_t                      s_conv_cap;
 static int                         s_internal;  /* present.surface=internal */
 static int                         s_layer_filter = -1;
+/* RECOMP_DEBUG=metal_drain=1 (KFC-1935): the present queue drain, main
+ * thread only, its keys read once in fbm_create. n is 0 while it is off:
+ * fbm_present then takes none of its time stamps. See qdrain_hold. */
+#define QDRAIN_MAX 4096
+static struct qdrain {
+    unsigned n;              /* the window's presents; 0: off */
+    double ms, gap;          /* the median threshold (ms), the least gap (s) */
+    unsigned fill, pos;      /* the window: samples held, next to write */
+    float wait[QDRAIN_MAX];  /* nextDrawable waits (ms), a ring */
+    double p50;              /* the median that armed it */
+    double last;             /* the last drain (CACurrentMediaTime); 0: none */
+    unsigned count;          /* drains so far, for #k */
+    int state;               /* 0 idle, 1 armed, 2 holding k/flip */
+    int k;                   /* held: the slot and flip not presented */
+    uint32_t flip;
+    double since;            /* held: the first present call not made */
+} s_qd;
 #ifdef XBOXRECOMP_ENHANCE
 static id<MTLRenderPipelineState>  s_pso_lines; /* present.shader: guest-line resolve */
 static id<MTLRenderPipelineState>  s_pso_ovl;  /* the overlay, premultiplied */
@@ -268,6 +285,27 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             s_layer.maximumDrawableCount = nd == 2 ? 2 : 3;
             if (nd == 2)
                 fprintf(stderr, "[PRESENT] metal_drawables=2: maximumDrawableCount 2\n");
+        }
+        /* RECOMP_DEBUG=metal_drain=1 (KFC-1935): read once, here */
+        if (recomp_env_on(RENV_METAL_DRAIN)) {
+            long dn = recomp_env_int(RENV_METAL_DRAIN_N, 180);
+            double dms = recomp_env_double(RENV_METAL_DRAIN_MS, 4.0);
+            double dgap = recomp_env_double(RENV_METAL_DRAIN_GAP_S, 15.0);
+            if (dn < 1)
+                dn = 180;
+            if (dn > QDRAIN_MAX)
+                dn = QDRAIN_MAX;
+            if (!(dms > 0))
+                dms = 4.0;
+            if (!(dgap >= 0))
+                dgap = 15.0;
+            memset(&s_qd, 0, sizeof s_qd);
+            s_qd.n = (unsigned)dn;
+            s_qd.ms = dms;
+            s_qd.gap = dgap;
+            fprintf(stderr, "[PRESENT] metal_drain: on, the median nextDrawable wait over %u"
+                    " presents > %.1f ms skips 1 present, at least %.1f s apart\n",
+                    s_qd.n, s_qd.ms, s_qd.gap);
         }
         s_layer.allowsNextDrawableTimeout = YES;
         /* The values the layer really holds, after the configuration above. */
@@ -879,6 +917,7 @@ static double s_pc_last_new;           /* presentedTime of the last new image */
 static struct pace_win {        /* main only: the line being gathered */
     double t0;
     unsigned shown, fresh, repeat, dropped, untracked;
+    unsigned drained;           /* metal_drain's skipped presents */
     uint64_t skipped;
     unsigned ni, na, ng, nq;
     float iv[PACE_SAMPLES], age[PACE_SAMPLES], gpu[PACE_SAMPLES];
@@ -935,6 +974,8 @@ static void pace_print(void)
             pace_pct(s_pw.gpu, s_pw.ng, 0.95, 2, f, sizeof f));
     if (s_pw.untracked)
         fprintf(stderr, " untracked %u", s_pw.untracked);
+    if (s_pw.drained)
+        fprintf(stderr, " drained %u", s_pw.drained);
     if (s_pw.nq) {
         static const char *const nm[9] = { "copy", "busy", "sdl", "loop", "drawable",
                                            "encode", "queue", "gpu", "display" };
@@ -1206,14 +1247,92 @@ static void pace_handlers(struct pace_rec *r, id<CAMetalDrawable> d, id<MTLComma
     }];
 }
 
+/* RECOMP_DEBUG=metal_drain=1 (KFC-1935, from TTT2's f763f02): after a hitch
+ * the layer's drawable queue can stay one deep too many, and the surplus
+ * shows as nextDrawable's wait. Each present's wait (t_drw - t_in, the
+ * pacing line's "drawable" part) goes into a window of n; when it is full,
+ * its median is above ms and gap seconds have passed since the last drain,
+ * the drain is armed. The next present of a new frame (a slot and flip not
+ * the last one presented, past the black paint, no shot) is then held:
+ * fbm_present returns 0 without a drawable, so the caller keeps the frame
+ * dirty and does not count a present. Calls for that same frame (an event
+ * waking the loop) are held too. The next new frame ends the hold and is
+ * presented as usual: that is the drain (counted, logged, the window
+ * emptied). The held frame never reaches the screen and the one before
+ * stays up a refresh more; with RECOMP_TRACE=pacing it counts in skipped
+ * (the seq gap) and in drained. If no new frame comes in QDRAIN_HOLD_S, the
+ * held frame is presented after all and nothing is counted. */
+#define QDRAIN_HOLD_S 0.05
+static int s_qd_pk = -1;        /* the last present's slot and flip */
+static uint32_t s_qd_pflip;
+
+/* 1: fbm_present makes no present for this call. */
+static int qdrain_hold(int k, uint32_t flip, uint32_t fw, const char *shot_path, double now)
+{
+    if (s_qd.state == 2) {
+        if (k == s_qd.k && flip == s_qd.flip) {
+            if (now - s_qd.since < QDRAIN_HOLD_S)
+                return 1;
+            fprintf(stderr, "[PRESENT] metal_drain: no new frame in %.0f ms; the held"
+                    " present shown, not a drain (t=%.3f s)\n", QDRAIN_HOLD_S * 1e3, now);
+        } else {
+            s_qd.count++;
+            s_qd.last = now;
+            s_pw.drained++;
+            fprintf(stderr, "[PRESENT] metal_drain: nextDrawable wait p50 %.1f ms over %u"
+                    " presents > %.1f ms; skipped 1 present (#%u, t=%.3f s)\n",
+                    s_qd.p50, s_qd.n, s_qd.ms, s_qd.count, s_qd.since);
+        }
+        s_qd.state = 0;
+        s_qd.fill = s_qd.pos = 0;
+        return 0;
+    }
+    if (s_qd.state == 1 && fw && !shot_path && (k != s_qd_pk || flip != s_qd_pflip)) {
+        s_qd.state = 2;
+        s_qd.k = k;
+        s_qd.flip = flip;
+        s_qd.since = now;
+        return 1;
+    }
+    return 0;
+}
+
+/* A present's nextDrawable wait (seconds), after the drawable came back. */
+static void qdrain_sample(double wait, int k, uint32_t flip, double now)
+{
+    static float sorted[QDRAIN_MAX];
+    double p50;
+
+    s_qd_pk = k;
+    s_qd_pflip = flip;
+    if (s_qd.state)
+        return;     /* armed: the window starts again after the drain */
+    s_qd.wait[s_qd.pos] = (float)(wait * 1e3);
+    s_qd.pos = (s_qd.pos + 1) % s_qd.n;
+    if (s_qd.fill < s_qd.n)
+        s_qd.fill++;
+    if (s_qd.fill < s_qd.n || (s_qd.last > 0 && now - s_qd.last < s_qd.gap))
+        return;
+    memcpy(sorted, s_qd.wait, s_qd.n * sizeof *sorted);
+    qsort(sorted, s_qd.n, sizeof *sorted, pace_cmp);
+    p50 = sorted[(size_t)(0.5 * (s_qd.n - 1) + 0.5)];
+    if (p50 > s_qd.ms) {
+        s_qd.p50 = p50;
+        s_qd.state = 1;
+    }
+}
+
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 uint32_t pad, int filter, const char *shot_path, uint32_t flip,
                 const struct nv2a_ovl_list *const *layers, int nlayers,
                 const struct fbm_pace_frame *pace)
 {
     int ok = 0;
-    double t_in = pace ? CACurrentMediaTime() : 0, t_drw = 0;   /* the age split */
+    /* the age split; metal_drain's wait */
+    double t_in = (pace || s_qd.n) ? CACurrentMediaTime() : 0, t_drw = 0;
 
+    if (s_qd.n && qdrain_hold(k, flip, fw, shot_path, t_in))
+        return 0;   /* metal_drain: no drawable, no present; the frame stays dirty */
     @autoreleasepool {
         id<CAMetalDrawable> d;
         id<MTLCommandBuffer> cb;
@@ -1284,8 +1403,10 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         d = [s_layer nextDrawable];
         if (!d)
             return 0;
-        if (pace)
+        if (pace || s_qd.n)
             t_drw = CACurrentMediaTime();
+        if (s_qd.n)
+            qdrain_sample(t_drw - t_in, k, flip, t_drw);
         dw = (int)[d.texture width];
         dh = (int)[d.texture height];
         {   /* the pixels the frame really goes out at, once and on each change */
